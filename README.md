@@ -53,6 +53,8 @@ picks `h264_nvenc` on Linux and fails to open it.
 
 `viam training-script test-local` does not support sequence datasets.
 
+Build a local `<image>` with `docker buildx build --platform linux/amd64 --build-arg CONVERTER_REF=<commit> -t viam-physicalai:dev --load .`
+
 Tests: `docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work -e PYTHONPATH=/work/physical-ai-studio <image> python3 -m pytest tests -q`
 
 ## 4. Build and register the container
@@ -64,18 +66,20 @@ viam train containers register --uri=docker.io/<user>/viam-physicalai:0.3.0-<n> 
   --description="physicalai-train 0.3.0" --org-id=<org>
 ```
 
-The Docker Hub repo must be public. Never re-push a tag that's already registered;
+`<commit>` is the viam-sequence-to-lerobot commit with `--action-arm`. The Docker Hub repo must be public. Never re-push a tag that's already registered;
 bump `<n>` instead.
 
 ## 5. Upload and train
 
 ```sh
-tar -czf physical-ai-studio.tar.gz physical-ai-studio/
+COPYFILE_DISABLE=1 tar --exclude=__pycache__ -czf physical-ai-studio.tar.gz physical-ai-studio/
 viam training-script upload --path=physical-ai-studio.tar.gz --org-id=<org> \
-  --script-name=physical-ai-studio --framework=unspecified
+  --script-name=physical-ai-studio --version=1 --framework=unspecified
 viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
   --model-name=<name> --model-version=1 --version=1 \
-  --script-name=<namespace>:physical-ai-studio --container-id=<container-id> \
+  --script-name=<org-id>:physical-ai-studio --container-id=<container-id> \
   --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'"
 viam train logs --job-id=<job-id>
 ```
+
+Re-uploading the script? Bump `--version` on upload and submit together.
