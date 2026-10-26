@@ -7,11 +7,13 @@ ARG PHYSICALAI_VERSION=0.3.0
 # Commit of viam-labs/viam-sequence-to-lerobot that includes --action-arm.
 ARG CONVERTER_REF
 
+# NVIDIA_DISABLE_REQUIRE: skip the base image's driver-branch check; torch bundles its CUDA runtime.
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
     PIP_NO_CACHE_DIR=1 \
     TORCH_HOME=/opt/torch \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    NVIDIA_DISABLE_REQUIRE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv ffmpeg libgl1 libglib2.0-0 git ca-certificates \
@@ -21,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN test -n "$CONVERTER_REF" \
     && pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
         "physicalai-train[cu128]==${PHYSICALAI_VERSION}" \
+        torch==2.11.0 torchvision==0.26.0 torchcodec==0.11.1 \
         "viam-sequence-to-lerobot @ git+https://github.com/viam-labs/viam-sequence-to-lerobot@${CONVERTER_REF}" \
         pytest
 
