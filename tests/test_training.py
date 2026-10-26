@@ -105,3 +105,24 @@ def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
         run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, **bad)
     assert exc.value.code == 2
     assert msg in capsys.readouterr().err
+
+
+def test_misspelled_camera_lists_present_components(tmp_path):
+    export = build_export(tmp_path, [CAM])
+    with pytest.raises(SystemExit) as exc:
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras="overhead-cma")
+    message = str(exc.value.code)
+    assert "overhead-cma" in message
+    assert "overhead-cam (GetImages)" in message and "leader-arm (JointPositions)" in message
+
+
+def test_missing_action_source_component_exits(tmp_path):
+    export = build_export(tmp_path, [CAM])
+    with pytest.raises(SystemExit, match="leader-amr"):
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, action_source="leader-amr")
+
+
+def test_staging_with_relative_image_paths_exits(tmp_path):
+    export = build_export(tmp_path, [CAM], absolute=False)
+    with pytest.raises(SystemExit, match="next to binary_data/"):
+        run(cloud_files(export), tmp_path / "out", arm=ARM, cameras=CAM)

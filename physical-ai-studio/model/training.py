@@ -8,9 +8,14 @@ plus custom `--key=value` arguments. Everything except tmp/ in
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 POLICIES = ("act",)
+# Names the converter's load_export() requires, in Viam's argument order below.
+PARQUET_FILES = ("sequences.parquet", "tabular_data.parquet", "binary_data.parquet")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,8 +61,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def resolve_export_dir(args: argparse.Namespace, work: Path) -> Path:
+    """Return a directory holding the three Parquet files under the converter's names.
+
+    A local `viam dataset export` already has them together, next to binary_data/,
+    and its relative image paths only resolve against that directory, so it is
+    used as-is. Otherwise (a cloud job) the files are symlinked into work/export,
+    which is only safe because cloud image paths are absolute (/gcs/...).
+    """
+    given = (args.sequences_file, args.tabular_data_file, args.binary_data_file)
+    files = dict(zip(PARQUET_FILES, given))
+    parents = {path.resolve().parent for path in files.values()}
+    if len(parents) == 1 and all(path.name == name for name, path in files.items()):
+        return parents.pop()
+
+    image_paths = pq.read_table(args.binary_data_file, columns=["path"]).column("path").to_pylist()
+    if any(not path.startswith("/") for path in image_paths):
+        raise SystemExit(
+            "binary_data paths are relative, so the three Parquet files must sit together in the "
+            f"export directory, next to binary_data/, named {', '.join(PARQUET_FILES)}"
+        )
+    stage = work / "export"
+    stage.mkdir()
+    for name, path in files.items():
+        (stage / name).symlink_to(path.resolve())
+    return stage
+
+
+def check_components(args: argparse.Namespace, export_dir: Path) -> None:
+    """Exit early when a named component never appears in the export (most likely a typo).
+
+    Without this, the converter skips every sequence and fails with a vaguer error.
+    """
+    cameras = set(
+        pq.read_table(export_dir / "binary_data.parquet", columns=["component_name"])
+        .column("component_name").to_pylist()
+    )
+    readings = {
+        (row["component_name"], row["method_name"])
+        for row in pq.read_table(
+            export_dir / "tabular_data.parquet", columns=["component_name", "method_name"]
+        ).to_pylist()
+    }
+    arms = [args.arm] if args.action_source == "next_state" else [args.arm, args.action_source]
+    missing = [c for c in args.cameras if c not in cameras]
+    missing += [a for a in arms if (a, "JointPositions") not in readings]
+    if missing:
+        present = sorted({f"{c} (GetImages)" for c in cameras} | {f"{c} ({m})" for c, m in readings})
+        raise SystemExit(
+            f"Components not found in the export: {', '.join(missing)}. Present: {', '.join(present)}"
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
-    parse_args(argv)
+    args = parse_args(argv)
+    with tempfile.TemporaryDirectory(prefix="physicalai-") as tmp:
+        work = Path(tmp)
+        export_dir = resolve_export_dir(args, work)
+        check_components(args, export_dir)
 
 
 if __name__ == "__main__":
