@@ -148,6 +148,10 @@ def test_trains_exports_and_runs_inference(tmp_path, layout):
     manifest = json.loads((out / "viam.json").read_text())
     assert manifest["schema_version"] == 1 and manifest["policy"] == "act"
     assert [c["component"] for c in manifest["cameras"]] == cameras
+    for cam in manifest["cameras"]:
+        assert {k: cam[k] for k in ("dtype", "layout", "color", "range")} == {
+            "dtype": "float32", "layout": "CHW", "color": "RGB", "range": [0, 1],
+        }
     assert manifest["state"]["component"] == ARM and manifest["state"]["dim"] == N_JOINTS
     assert manifest["action"] == {
         "source": action_source, "apply": "MoveToJointPositions", "component": ARM,

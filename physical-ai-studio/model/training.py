@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import tempfile
 import time
 from importlib import metadata
@@ -149,8 +150,15 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     from physicalai.policies import ACT
     from physicalai.train import Trainer
 
+    # Docker's default 64 MB /dev/shm kills DataLoader workers with a bus error, and Viam
+    # sets the job's --shm-size, not us. num_workers=0 also disables persistent_workers.
+    shm = shutil.disk_usage("/dev/shm").total
+    workers = {}
+    if shm < 1 << 30:
+        logger.warning("/dev/shm is only %d MiB: loading data in the main process (num_workers=0)", shm >> 20)
+        workers["num_workers"] = 0
     datamodule = LeRobotDataModule(
-        repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size
+        repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
     )
     policy = ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps)
     # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
@@ -183,7 +191,11 @@ def model_inputs(policy, cameras: list[str]) -> tuple[list[dict], dict]:
             if len(matches) != 1:
                 raise RuntimeError(f"Cannot map camera {camera!r} to one exported input in {image_inputs}")
             name = matches[0]
-        entries.append({"component": camera, "input": name, "shape": schema[name], "method": "GetImages"})
+        # The graph normalizes internally; it takes frames as LeRobot decodes them.
+        entries.append({
+            "component": camera, "input": name, "shape": schema[name], "method": "GetImages",
+            "dtype": "float32", "layout": "CHW", "color": "RGB", "range": [0, 1],
+        })
     return entries, {"input": STATE, "shape": schema[STATE]}
 
 
@@ -195,7 +207,9 @@ def package_version(name: str) -> str:
     return f"{dist.version}+{commit[:12]}" if commit else dist.version
 
 
-def write_manifest(args, out: Path, summary, policy, device: str, wall_time_s: float) -> dict:
+def write_manifest(
+    args, out: Path, summary, policy, device: str, wall_time_s: float, versions: dict[str, str]
+) -> dict:
     """Write viam.json: what the inference module needs beyond the export's manifest.json."""
     cameras, state = model_inputs(policy, args.cameras)
     dim = state["shape"][0]  # the converter guarantees action dim == state dim in joints mode
@@ -224,10 +238,7 @@ def write_manifest(args, out: Path, summary, policy, device: str, wall_time_s: f
             "device": device,
             "wall_time_s": round(wall_time_s),
         },
-        "versions": {
-            name: package_version(name)
-            for name in ("physicalai-train", "physicalai", "lerobot", "viam-sequence-to-lerobot")
-        },
+        "versions": versions,
     }
     (out / "viam.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
@@ -237,6 +248,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     start = time.monotonic()
+    # Up front: a missing package must not throw away a finished training run.
+    versions = {
+        name: package_version(name)
+        for name in ("physicalai-train", "physicalai", "lerobot", "viam-sequence-to-lerobot")
+    }
     out = args.model_output_directory
     out.mkdir(parents=True, exist_ok=True)
     # Dataset and checkpoints go to local disk: the output dir may be a slow /gcs/ mount.
@@ -257,7 +273,7 @@ def main(argv: list[str] | None = None) -> None:
             ) from exc
         policy, device = train(args, work / "dataset", work / "ckpt")
         policy.export(out, backend="openvino")
-    manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start)
+    manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)
     logger.info(
         "Done: %d episodes, %d frames, %d sequences skipped, device %s, %ds",
         summary.episodes_written,
