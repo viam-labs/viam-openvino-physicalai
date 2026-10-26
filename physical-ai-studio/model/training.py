@@ -8,10 +8,19 @@ plus custom `--key=value` arguments. Everything except tmp/ in
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import tempfile
+import time
+from importlib import metadata
 from pathlib import Path
 
 import pyarrow.parquet as pq
+
+logger = logging.getLogger("physical-ai-studio")
+
+# LeRobot dataset name; the converter and the datamodule must agree on it.
+DATASET_REPO_ID = "viam/dataset"
 
 POLICIES = ("act",)
 # Names the converter's load_export() requires, in Viam's argument order below.
@@ -113,12 +122,150 @@ def check_components(args: argparse.Namespace, export_dir: Path) -> None:
         )
 
 
+def convert_dataset(args: argparse.Namespace, export_dir: Path, dataset_root: Path):
+    """Convert the Viam export into a LeRobot v3 dataset at dataset_root (must not exist)."""
+    # Imported here: lerobot must not load before logging is configured (converter's streaming.py).
+    from viam_sequence_to_lerobot.convert import ConversionConfig, convert
+
+    return convert(
+        ConversionConfig(
+            export_dir=export_dir,
+            output_root=dataset_root,
+            repo_id=DATASET_REPO_ID,
+            task=args.task,
+            camera_components=tuple(args.cameras),
+            arm_component=args.arm,
+            action_arm=None if args.action_source == "next_state" else args.action_source,
+            fps=args.fps,
+            image_size=args.image_size,
+            vcodec=args.vcodec,
+        )
+    )
+
+
+def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
+    """Train the policy; return it and the device type it trained on."""
+    from physicalai.data import LeRobotDataModule
+    from physicalai.policies import ACT
+    from physicalai.train import Trainer
+
+    datamodule = LeRobotDataModule(
+        repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size
+    )
+    policy = ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps)
+    # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
+    # script per rank (re-converting, and every rank exporting to out).
+    trainer = Trainer(
+        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir
+    )
+    device = trainer.strategy.root_device.type
+    if device == "cpu":
+        logger.warning("Training on CPU: expected for local runs, but in a cloud job no GPU was found")
+    else:
+        logger.info("Training on %s", trainer.strategy.root_device)
+    trainer.fit(model=policy, datamodule=datamodule)
+    return policy, device
+
+
+def model_inputs(policy, cameras: list[str]) -> tuple[list[dict], dict]:
+    """Map each camera, and the state, to the exported model's input name and shape."""
+    from physicalai.inference.constants import IMAGES, STATE
+
+    schema = {feature.name: list(feature.shape) for feature in policy.inputs_schema}
+    image_inputs = [name for name in schema if name == IMAGES or name.startswith(f"{IMAGES}.")]
+    entries = []
+    for camera in cameras:
+        if len(cameras) == 1 and image_inputs == [IMAGES]:
+            name = IMAGES
+        else:
+            safe = camera.replace("-", "_").replace(".", "_")  # converter's camera_feature_key()
+            matches = [n for n in image_inputs if n.endswith(f".{safe}")]
+            if len(matches) != 1:
+                raise RuntimeError(f"Cannot map camera {camera!r} to one exported input in {image_inputs}")
+            name = matches[0]
+        entries.append({"component": camera, "input": name, "shape": schema[name], "method": "GetImages"})
+    return entries, {"input": STATE, "shape": schema[STATE]}
+
+
+def package_version(name: str) -> str:
+    """Installed version, with the commit for VCS installs (the converter)."""
+    dist = metadata.distribution(name)
+    direct_url = json.loads(dist.read_text("direct_url.json") or "{}")
+    commit = direct_url.get("vcs_info", {}).get("commit_id")
+    return f"{dist.version}+{commit[:12]}" if commit else dist.version
+
+
+def write_manifest(args, out: Path, summary, policy, device: str, wall_time_s: float) -> dict:
+    """Write viam.json: what the inference module needs beyond the export's manifest.json."""
+    cameras, state = model_inputs(policy, args.cameras)
+    dim = state["shape"][0]  # the converter guarantees action dim == state dim in joints mode
+    manifest = {
+        "schema_version": 1,
+        "policy": args.policy,
+        "fps": args.fps,
+        "cameras": cameras,
+        "image_size": args.image_size,
+        "state": {**state, "component": args.arm, "method": "JointPositions", "units": "degrees", "dim": dim},
+        "action": {
+            "source": args.action_source,
+            "apply": "MoveToJointPositions",
+            "component": args.arm,  # always the follower: that's what gets commanded at inference
+            "units": "degrees",
+            "dim": dim,
+        },
+        "tasks": sorted(summary.tasks_written),
+        "training": {
+            "args": {"max_epochs": args.max_epochs, "batch_size": args.batch_size,
+                     "chunk_size": args.chunk_size, "n_action_steps": args.n_action_steps,
+                     "vcodec": args.vcodec, "task": args.task},
+            "episodes": summary.episodes_written,
+            "frames": summary.frames_written,
+            "skipped_sequences": len(summary.skipped),
+            "device": device,
+            "wall_time_s": round(wall_time_s),
+        },
+        "versions": {
+            name: package_version(name)
+            for name in ("physicalai-train", "physicalai", "lerobot", "viam-sequence-to-lerobot")
+        },
+    }
+    (out / "viam.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    start = time.monotonic()
+    out = args.model_output_directory
+    out.mkdir(parents=True, exist_ok=True)
+    # Dataset and checkpoints go to local disk: the output dir may be a slow /gcs/ mount.
     with tempfile.TemporaryDirectory(prefix="physicalai-") as tmp:
         work = Path(tmp)
         export_dir = resolve_export_dir(args, work)
         check_components(args, export_dir)
+        try:
+            summary = convert_dataset(args, export_dir, work / "dataset")
+        except ValueError as exc:
+            # load_export silently drops images whose files are missing, so a misplaced
+            # binary_data/ only shows up here, as every sequence lacking camera frames.
+            if not str(exc).startswith("No convertible episodes"):
+                raise
+            raise SystemExit(
+                f"{exc}\nIf every sequence reports 'no frames from camera', check that "
+                "binary_data/ sits next to the Parquet files."
+            ) from exc
+        policy, device = train(args, work / "dataset", work / "ckpt")
+        policy.export(out, backend="openvino")
+    manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start)
+    logger.info(
+        "Done: %d episodes, %d frames, %d sequences skipped, device %s, %ds",
+        summary.episodes_written,
+        summary.frames_written,
+        len(summary.skipped),
+        device,
+        manifest["training"]["wall_time_s"],
+    )
 
 
 if __name__ == "__main__":

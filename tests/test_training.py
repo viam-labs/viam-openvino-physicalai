@@ -126,3 +126,57 @@ def test_staging_with_relative_image_paths_exits(tmp_path):
     export = build_export(tmp_path, [CAM], absolute=False)
     with pytest.raises(SystemExit, match="next to binary_data/"):
         run(cloud_files(export), tmp_path / "out", arm=ARM, cameras=CAM)
+
+
+@pytest.mark.parametrize("layout", ["local", "cloud"])
+def test_trains_exports_and_runs_inference(tmp_path, layout):
+    # local: one camera, relative paths, next-state actions.
+    # cloud: two cameras, absolute paths, staged inputs, leader-arm actions.
+    from physicalai.inference import InferenceModel
+
+    cloud = layout == "cloud"
+    cameras = [CAM, WRIST] if cloud else [CAM]
+    action_source = LEADER if cloud else "next_state"
+    export = build_export(tmp_path, cameras, absolute=cloud)
+    files = cloud_files(export) if cloud else local_files(export)
+    out = tmp_path / "out"
+
+    run(files, out, arm=ARM, cameras=" ".join(cameras), action_source=action_source,
+        max_epochs=1, batch_size=2, vcodec="libsvtav1", chunk_size=10, n_action_steps=5)
+
+    assert (out / "act.xml").is_file() and (out / "manifest.json").is_file()
+    manifest = json.loads((out / "viam.json").read_text())
+    assert manifest["schema_version"] == 1 and manifest["policy"] == "act"
+    assert [c["component"] for c in manifest["cameras"]] == cameras
+    assert manifest["state"]["component"] == ARM and manifest["state"]["dim"] == N_JOINTS
+    assert manifest["action"] == {
+        "source": action_source, "apply": "MoveToJointPositions", "component": ARM,
+        "units": "degrees", "dim": N_JOINTS,
+    }
+    assert manifest["tasks"] == ["pick the cube"]
+    assert manifest["training"]["args"]["chunk_size"] == 10
+    assert manifest["training"]["args"]["n_action_steps"] == 5
+    frames_per_episode = TICKS if cloud else TICKS - 1  # next_state consumes the last tick
+    assert manifest["training"]["episodes"] == 2
+    assert manifest["training"]["frames"] == 2 * frames_per_episode
+
+    # The manifest's input names and shapes must be exactly what the exported model takes.
+    model = InferenceModel(out)
+    obs = {manifest["state"]["input"]: np.zeros((1, *manifest["state"]["shape"]), np.float32)}
+    for cam in manifest["cameras"]:
+        obs[cam["input"]] = np.zeros((1, *cam["shape"]), np.float32)
+    assert model.select_action(obs).shape == (N_JOINTS,)
+
+
+def test_zero_episodes_hints_at_export_layout(tmp_path):
+    export = build_export(tmp_path, [CAM])
+    (export / "binary_data").rename(tmp_path / "misplaced")  # images no longer resolve
+    with pytest.raises(SystemExit, match="binary_data/ sits next to"):
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM)
+
+
+def test_leader_joint_mismatch_fails_before_training(tmp_path):
+    export = build_export(tmp_path, [CAM], leader_joints=N_JOINTS + 1)
+    with pytest.raises(ValueError, match=f"has {N_JOINTS + 1} joints"):
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, action_source=LEADER)
+    assert not (tmp_path / "out" / "viam.json").exists()
