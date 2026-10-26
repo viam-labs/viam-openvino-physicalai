@@ -91,10 +91,17 @@ def run(files: dict[str, Path], out: Path, **custom) -> None:
 
 
 @pytest.mark.parametrize(
-    "bad", [{"max_epoch": 1}, {"policy": "pi05"}, {"chunk_size": 5, "n_action_steps": 10}]
+    "bad, msg",
+    [
+        ({"max_epoch": 1}, "--max_epoch"),
+        ({"policy": "pi05"}, "invalid choice: 'pi05'"),
+        ({"chunk_size": 5, "n_action_steps": 10}, "--n_action_steps"),
+        ({"action_source": ARM}, "--action_source"),
+    ],
 )
-def test_bad_custom_args_exit_2(tmp_path, bad):
+def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
     export = build_export(tmp_path, [CAM])
     with pytest.raises(SystemExit) as exc:
         run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, **bad)
     assert exc.value.code == 2
+    assert msg in capsys.readouterr().err

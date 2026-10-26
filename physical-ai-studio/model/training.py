@@ -41,10 +41,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=8)
     # ACT's library defaults; at 10 fps, 100 steps is ~10 s of open-loop actions.
     parser.add_argument("--chunk_size", type=int, default=100, help="actions predicted per inference")
-    parser.add_argument("--n_action_steps", type=int, default=100, help="actions executed per inference")
+    parser.add_argument(
+        "--n_action_steps", type=int, default=None, help="actions executed per inference (default: chunk_size)"
+    )
     args = parser.parse_args(argv)
     if not args.cameras:
         parser.error("--cameras must name at least one camera component")
+    if args.n_action_steps is None:
+        args.n_action_steps = args.chunk_size
+    if args.action_source == args.arm:
+        parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
     if not 1 <= args.n_action_steps <= args.chunk_size:
         parser.error("--n_action_steps must be between 1 and --chunk_size")
     return args
