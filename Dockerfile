@@ -7,16 +7,18 @@ ARG PHYSICALAI_VERSION=0.3.0
 # Commit of viam-labs/viam-sequence-to-lerobot that includes --action-arm.
 ARG CONVERTER_REF
 
+# torchcodec's cu128 build dlopens libpython3.12 and NPP (libnppicc.so.12), which torch doesn't ship.
 # NVIDIA_DISABLE_REQUIRE: skip the base image's driver-branch check; torch bundles its CUDA runtime.
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
     PIP_NO_CACHE_DIR=1 \
     TORCH_HOME=/opt/torch \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
-    NVIDIA_DISABLE_REQUIRE=1
+    NVIDIA_DISABLE_REQUIRE=1 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/npp/lib
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv ffmpeg libgl1 libglib2.0-0 git ca-certificates \
+        python3 python3-venv libpython3.12t64 ffmpeg libgl1 libglib2.0-0 git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 
@@ -24,8 +26,10 @@ RUN test -n "$CONVERTER_REF" \
     && pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
         "physicalai-train[cu128]==${PHYSICALAI_VERSION}" \
         torch==2.11.0 torchvision==0.26.0 torchcodec==0.11.1 \
+        "nvidia-npp-cu12==12.3.3.*" \
         "viam-sequence-to-lerobot @ git+https://github.com/viam-labs/viam-sequence-to-lerobot@${CONVERTER_REF}" \
         pytest
 
 # ACT's ResNet18 backbone weights, so jobs don't download them on GPU time.
-RUN python3 -c "import torchvision; torchvision.models.resnet18(weights='IMAGENET1K_V1')"
+RUN python3 -c "import torchvision; torchvision.models.resnet18(weights='IMAGENET1K_V1')" \
+    && python3 -c "import torchcodec.decoders"  # fails the build if libtorchcodec cannot load
