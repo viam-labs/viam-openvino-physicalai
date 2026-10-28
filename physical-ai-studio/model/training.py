@@ -28,6 +28,11 @@ POLICIES = ("act",)
 PARQUET_FILES = ("sequences.parquet", "tabular_data.parquet", "binary_data.parquet")
 
 
+def unquote(value: str) -> str:
+    """Viam passes `--args=cameras="'a b'"` values through with the shell quotes still on."""
+    return value.strip("'\"")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse Viam's arguments strictly: an unknown or misspelled custom arg exits 2."""
     # allow_abbrev=False: otherwise a truncated typo like --max_epoch silently matches --max_epochs.
@@ -40,7 +45,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Custom arguments.
     parser.add_argument("--arm", required=True, help="follower arm component; source of the state")
     parser.add_argument(
-        "--cameras", type=str.split, required=True,
+        "--cameras", type=lambda s: unquote(s).split(), required=True,
         help="space-separated camera components; the first is the frame clock",
     )
     parser.add_argument(
@@ -51,7 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=10, help="must match the capture frequency_hz")
     parser.add_argument("--image_size", type=int, default=None, help="downscale longest image side")
     parser.add_argument("--vcodec", default="auto", help="libsvtav1 if hardware encoding fails")
-    parser.add_argument("--task", default=None, help="instruction for sequences without a cmd: tag")
+    parser.add_argument("--task", type=unquote, default=None, help="instruction for sequences without a cmd: tag")
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     # ACT's library defaults; at 10 fps, 100 steps is ~10 s of open-loop actions.

@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from model.training import main
+from model.training import main, parse_args
 
 CAM, WRIST, ARM, LEADER = "overhead-cam", "wrist-cam", "follower-arm", "leader-arm"
 N_JOINTS, TICKS = 6, 15
@@ -184,3 +184,9 @@ def test_leader_joint_mismatch_fails_before_training(tmp_path):
     with pytest.raises(ValueError, match=f"has {N_JOINTS + 1} joints"):
         run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, action_source=LEADER)
     assert not (tmp_path / "out" / "viam.json").exists()
+
+
+def test_viam_quoted_values_are_unquoted(tmp_path):
+    files = [f"--{arg}=x" for arg in ARG_FOR_FILE] + [f"--model_output_directory={tmp_path}"]
+    args = parse_args(files + [f"--arm={ARM}", f"--cameras='{CAM} {WRIST}'", "--task='open the box'"])
+    assert args.cameras == [CAM, WRIST] and args.task == "open the box"
