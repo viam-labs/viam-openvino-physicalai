@@ -9,13 +9,14 @@ ARG CONVERTER_REF
 
 # torchcodec's cu128 build dlopens libpython3.12 and NPP (libnppicc.so.12), which torch doesn't ship.
 # NVIDIA_DISABLE_REQUIRE: skip the base image's driver-branch check; torch bundles its CUDA runtime.
+# /usr/local/nvidia: Google's GPU nodes (Viam cloud training) mount the driver there.
 ENV DEBIAN_FRONTEND=noninteractive \
-    PATH=/opt/venv/bin:$PATH \
+    PATH=/opt/venv/bin:/usr/local/nvidia/bin:$PATH \
     PIP_NO_CACHE_DIR=1 \
     TORCH_HOME=/opt/torch \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     NVIDIA_DISABLE_REQUIRE=1 \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/venv/lib/python3.12/site-packages/nvidia/npp/lib
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/opt/venv/lib/python3.12/site-packages/nvidia/npp/lib
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv libpython3.12t64 ffmpeg libgl1 libglib2.0-0 git ca-certificates \
