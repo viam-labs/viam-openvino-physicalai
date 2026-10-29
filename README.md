@@ -29,7 +29,7 @@ each sequence becomes one training episode. Add the sequences to a sequence data
 | `policy` | `act` | only `act` for now |
 | `fps` | `10` | must match the capture `frequency_hz` |
 | `image_size` | unset | downscale the longest image side |
-| `vcodec` | `auto` | set `libsvtav1` if hardware video encoding fails |
+| `vcodec` | `auto` | set `libsvtav1` on Viam cloud GPUs (NVENC is not permitted there) and locally |
 | `task` | unset | instruction for sequences without a `cmd:` tag |
 | `max_epochs` | `100` | |
 | `batch_size` | `8` | |
@@ -78,8 +78,12 @@ viam training-script upload --path=physical-ai-studio.tar.gz --org-id=<org> \
 viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
   --model-name=<name> --model-version=1 --version=1 \
   --script-name=<org-id>:physical-ai-studio --container-id=<container-id> \
-  --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'"
+  --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",vcodec=libsvtav1
 viam train logs --job-id=<job-id>
 ```
 
 Re-uploading the script? Bump `--version` on upload and submit together.
+
+Run the job in the dataset's org: reading another org's images fails with
+`OSError: [Errno 5] Input/output error` on `/gcs/...`. Images load through `/gcs`
+slowly (~70k images took about 2 hours), so expect a long wait before training starts.
