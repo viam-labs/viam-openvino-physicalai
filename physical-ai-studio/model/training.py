@@ -8,8 +8,11 @@ plus custom `--key=value` arguments. Everything except tmp/ in
 from __future__ import annotations
 
 import argparse
+import ctypes
+import glob
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -260,6 +263,19 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("GPU available: %s", torch.cuda.get_device_name(0))
     else:
         logger.warning("No GPU available: training will run on CPU")
+        try:
+            ctypes.CDLL("libcuda.so.1")
+            libcuda = "loads"
+        except OSError as exc:
+            libcuda = str(exc)
+        logger.warning(
+            "GPU diagnostics: torch CUDA %s, /dev/nvidia* %s, /usr/local/nvidia %s, LD_LIBRARY_PATH %s, libcuda.so.1 %s",
+            torch.version.cuda,
+            sorted(glob.glob("/dev/nvidia*")),
+            sorted(str(p) for p in Path("/usr/local/nvidia").glob("*/*"))[:20],
+            os.environ.get("LD_LIBRARY_PATH"),
+            libcuda,
+        )
     # Up front: a missing package must not throw away a finished training run.
     versions = {
         name: package_version(name)
