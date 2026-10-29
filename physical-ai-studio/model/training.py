@@ -253,6 +253,13 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     start = time.monotonic()
+    import torch
+
+    # Logged first so a cloud job's device is visible before the long conversion step.
+    if torch.cuda.is_available():
+        logger.info("GPU available: %s", torch.cuda.get_device_name(0))
+    else:
+        logger.warning("No GPU available: training will run on CPU")
     # Up front: a missing package must not throw away a finished training run.
     versions = {
         name: package_version(name)
