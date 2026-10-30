@@ -73,3 +73,9 @@ def test_unsupported_package_raises(tmp_path, overrides, msg):
 def test_missing_viam_json_raises(tmp_path):
     with pytest.raises(LoadError, match="viam.json"):
         read_package(tmp_path, device="CPU")
+
+
+def test_malformed_viam_json_raises(tmp_path):
+    (tmp_path / "viam.json").write_text("{not json")
+    with pytest.raises(LoadError, match="viam.json"):
+        read_package(tmp_path, device="CPU")

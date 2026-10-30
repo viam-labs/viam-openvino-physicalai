@@ -70,7 +70,7 @@ def read_package(path: Path | str, *, device: str) -> Package:
     path = Path(path)
     try:
         meta = json.loads((path / "viam.json").read_text())
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise LoadError(f"cannot read viam.json in {path}: {exc}") from exc
     if meta.get("schema_version") != 1:
         raise LoadError(f"unsupported viam.json schema_version {meta.get('schema_version')!r} (expected 1)")
