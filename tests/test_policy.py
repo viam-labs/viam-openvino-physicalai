@@ -2,8 +2,12 @@ import json
 
 import numpy as np
 import pytest
+from viam.proto.app.robot import ServiceConfig
+from viam.utils import dict_to_struct
 
-from src.policy import ConfigError, LoadError, PolicyConfig, read_package
+from src.policy import ConfigError, LoadError, PhysicalAIPolicy, PolicyConfig, read_package
+from src.wire import WireError
+from tests.vla_encode import encode_image
 
 CAMS = [("cam-a", "images.cam_a", [3, 8, 16]), ("cam-b", "images.cam_b", [3, 16, 8])]
 N_STEPS, DIM = 4, 6
@@ -79,3 +83,130 @@ def test_malformed_viam_json_raises(tmp_path):
     (tmp_path / "viam.json").write_text("{not json")
     with pytest.raises(LoadError, match="viam.json"):
         read_package(tmp_path, device="CPU")
+
+
+class FakeModel:
+    """Stands in for physicalai's InferenceModel: records batches, returns a fixed chunk."""
+
+    instances: list = []
+
+    def __init__(self, path, device):
+        self.path, self.device, self.batches, self.resets = path, device, [], 0
+        FakeModel.instances.append(self)
+
+    def predict_action_chunk(self, batch):
+        self.batches.append(batch)
+        return np.arange(N_STEPS * DIM, dtype=np.float32).reshape(N_STEPS, DIM)
+
+    def reset(self):
+        self.resets += 1
+
+
+async def make_policy(tmp_path, factory=FakeModel, **attrs):
+    svc = PhysicalAIPolicy("policy")
+    svc._model_factory = factory
+    attrs = {"model_path": str(write_package(tmp_path / "m")), "device": "CPU"} | attrs
+    svc.reconfigure(ServiceConfig(name="policy", attributes=dict_to_struct(attrs)), {})
+    await svc._load_task
+    return svc
+
+
+def infer_request(**overrides):
+    images = {key: encode_image(np.zeros((s[1], s[2], 3), np.uint8), encoding="jpeg") for _, key, s in CAMS}
+    return {"command": "infer", "images": images, "state": {"values": [0.0] * DIM}, "task": "open the box"} | overrides
+
+
+async def test_ready_after_load_with_warmups(tmp_path):
+    FakeModel.instances.clear()
+    svc = await make_policy(tmp_path, warmup_inferences=3)
+    assert await svc.do_command({"command": "status"}) == {"state": "ready", "error": ""}
+    model = FakeModel.instances[-1]
+    assert (model.path, model.device, len(model.batches)) == (str(tmp_path / "m"), "CPU", 3)
+
+
+async def test_specs_and_reset(tmp_path):
+    FakeModel.instances.clear()
+    svc = await make_policy(tmp_path)
+    specs = await svc.do_command({"command": "specs"})
+    assert specs["n_action_steps"] == N_STEPS and specs["image_feature_keys"] == ["images.cam_a", "images.cam_b"]
+    assert await svc.do_command({"command": "reset"}) == {"ok": True}
+    assert FakeModel.instances[-1].resets == 1
+
+
+async def test_infer_converts_inputs_and_returns_chunk(tmp_path):
+    FakeModel.instances.clear()
+    svc = await make_policy(tmp_path, warmup_inferences=0)
+    out = await svc.do_command(infer_request())
+    rows = np.array(out["actions"]["rows"])
+    assert rows.shape == (N_STEPS, DIM) and out["raw_actions"] == out["actions"] and out["latency_s"] >= 0
+    batch = FakeModel.instances[-1].batches[-1]
+    assert batch["images.cam_a"].shape == (1, 3, 8, 16) and batch["images.cam_a"].dtype == np.float32
+    assert batch["images.cam_b"].shape == (1, 3, 16, 8)
+    assert batch["state"].shape == (1, DIM) and batch["task"] == ["open the box"]
+
+
+async def test_infer_defaults_task_to_viam_json(tmp_path):
+    FakeModel.instances.clear()
+    svc = await make_policy(tmp_path, warmup_inferences=0)
+    request = infer_request()
+    del request["task"]
+    await svc.do_command(request)
+    assert FakeModel.instances[-1].batches[-1]["task"] == ["open the box"]
+
+
+@pytest.mark.parametrize(
+    "overrides, msg",
+    [
+        ({"images": {}}, "image_feature_keys"),
+        ({"state": {"values": [0.0] * (DIM + 1)}}, "state_dim"),
+        ({"rtc": {"inference_delay": 1}}, "RTC"),
+        ({"task": 3}, "task"),
+    ],
+)
+async def test_bad_infer_requests_raise(tmp_path, overrides, msg):
+    svc = await make_policy(tmp_path, warmup_inferences=0)
+    with pytest.raises(WireError, match=msg):
+        await svc.do_command(infer_request(**overrides))
+
+
+async def test_load_failure_reports_status(tmp_path):
+    svc = await make_policy(tmp_path, model_path=str(tmp_path / "missing"))
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed" and "viam.json" in status["error"]
+    with pytest.raises(RuntimeError, match="not ready"):
+        await svc.do_command({"command": "specs"})
+
+
+async def test_model_construction_error_reports_status(tmp_path):
+    def broken(path, device):
+        raise RuntimeError("NPU plugin not available")
+
+    svc = await make_policy(tmp_path, factory=broken)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed" and "NPU plugin not available" in status["error"]
+
+
+async def test_load_timeout_reports_status(tmp_path):
+    def slow(path, device):
+        import time
+        time.sleep(0.5)
+        return FakeModel(path, device)
+
+    svc = await make_policy(tmp_path, factory=slow, load_timeout_s=0.05)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed" and "timed out" in status["error"]
+
+
+async def test_unknown_command_and_close(tmp_path):
+    svc = await make_policy(tmp_path)
+    with pytest.raises(ValueError, match="unknown command"):
+        await svc.do_command({"command": "nope"})
+    await svc.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await svc.do_command({"command": "status"})
+
+
+def test_validate_config_rejects_bad_device():
+    cfg = ServiceConfig(name="policy", attributes=dict_to_struct({"model_path": "/m", "device": "TPU"}))
+    with pytest.raises(ConfigError, match="device"):
+        PhysicalAIPolicy.validate_config(cfg)
