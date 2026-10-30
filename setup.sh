@@ -11,5 +11,5 @@ fi
 # viam-server re-runs first_run for each new module version.
 uv venv --python 3.12 --allow-existing "$VENV"
 VIRTUAL_ENV="$VENV" uv pip install -q -r requirements.txt
-# physicalai pulls in pyturbojpeg, which needs the system libturbojpeg on Linux: fail here, not at start.
+# Fail here, not at the first reconfigure: policy.py imports physicalai lazily.
 "$VENV/bin/python" -c "import physicalai.inference, openvino; print('setup.sh: physicalai', openvino.__version__, 'OK')"
