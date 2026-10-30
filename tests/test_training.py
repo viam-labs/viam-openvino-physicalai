@@ -193,7 +193,8 @@ def test_viam_quoted_values_are_unquoted(tmp_path):
     assert args.cameras == [CAM, WRIST] and args.task == "open the box"
 
 
-def test_gcs_images_are_staged_with_local_paths(tmp_path, monkeypatch):
+@pytest.mark.parametrize("together", [False, True])
+def test_gcs_images_are_staged_with_local_paths(tmp_path, monkeypatch, together):
     export = build_export(tmp_path, [CAM], absolute=True)
     table = pq.read_table(export / "binary_data.parquet")
     gcs = [p.replace(str(export), "/gcs/bucket") for p in table.column("path").to_pylist()]
@@ -202,7 +203,8 @@ def test_gcs_images_are_staged_with_local_paths(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(training, "download_images", lambda paths, dest: seen.extend(paths) or
                         [str(dest / f"{i}.jpeg") for i in range(len(paths))])
-    files = cloud_files(export)
+    # A Viam cloud job hands over the three files together under the converter's names.
+    files = {arg: export / name for arg, name in ARG_FOR_FILE.items()} if together else cloud_files(export)
     args = parse_args([f"--{a}={p}" for a, p in files.items()] +
                       [f"--model_output_directory={tmp_path / 'out'}", f"--arm={ARM}", f"--cameras={CAM}"])
     (tmp_path / "work").mkdir()

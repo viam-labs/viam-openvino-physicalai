@@ -99,19 +99,20 @@ def resolve_export_dir(args: argparse.Namespace, work: Path) -> Path:
 
     A local `viam dataset export` already has them together, next to binary_data/,
     and its relative image paths only resolve against that directory, so it is
-    used as-is. Otherwise (a cloud job) the files are staged in work/export, which is
-    only safe because cloud image paths are absolute (/gcs/...). Images under /gcs/ are
-    first copied to local disk: the converter checks and reads each one in turn, a
-    network round trip apiece through the mount, which took hours for 70k images.
+    used as-is. Otherwise the files are staged in work/export, which is only safe
+    because cloud image paths are absolute (/gcs/...). Images under /gcs/ are first
+    copied to local disk, even when a cloud job hands over the three files together:
+    the converter checks and reads each one in turn, a network round trip apiece
+    through the mount, which took hours for 70k images.
     """
     given = (args.sequences_file, args.tabular_data_file, args.binary_data_file)
     files = dict(zip(PARQUET_FILES, given))
     parents = {path.resolve().parent for path in files.values()}
-    if len(parents) == 1 and all(path.name == name for name, path in files.items()):
-        return parents.pop()
-
+    together = len(parents) == 1 and all(path.name == name for name, path in files.items())
     logger.info("Reading image paths from %s", args.binary_data_file)
     image_paths = pq.read_table(args.binary_data_file, columns=["path"]).column("path").to_pylist()
+    if together and not any(p.startswith("/gcs/") for p in image_paths):
+        return parents.pop()
     if any(not path.startswith("/") for path in image_paths):
         raise SystemExit(
             "binary_data paths are relative, so the three Parquet files must sit together in the "
