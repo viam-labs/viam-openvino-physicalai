@@ -12,12 +12,16 @@ IMG = RNG.integers(0, 255, (12, 20, 3), dtype=np.uint8)
 
 @pytest.mark.parametrize("encoding", ["raw", "png"])
 def test_lossless_round_trip(encoding):
-    np.testing.assert_array_equal(decode_image(encode_image(IMG, encoding=encoding)), IMG)
+    out = decode_image(encode_image(IMG, encoding=encoding))
+    np.testing.assert_array_equal(out, IMG)
+    assert out.flags.writeable
 
 
 def test_jpeg_round_trip_shape():
-    out = decode_image(encode_image(IMG, encoding="jpeg"))
-    assert out.shape == IMG.shape and out.dtype == np.uint8
+    smooth = np.broadcast_to(np.linspace(0, 255, 20, dtype=np.uint8)[None, :, None], (12, 20, 3)).copy()
+    out = decode_image(encode_image(smooth, encoding="jpeg"))
+    assert out.shape == smooth.shape and out.dtype == np.uint8
+    assert np.abs(out.astype(int) - smooth.astype(int)).mean() < 5
 
 
 @pytest.mark.parametrize(

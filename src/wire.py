@@ -82,6 +82,7 @@ def decode_image(payload: dict[str, Any]) -> np.ndarray:
         )
     return out
 
+
 def encode_matrix(m: np.ndarray) -> dict[str, Any]:
     if m.ndim != 2:
         raise WireError(f"expected 2D matrix, got shape {m.shape}")
