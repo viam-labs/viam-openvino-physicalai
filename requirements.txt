@@ -1,0 +1,3 @@
+viam-sdk==0.85.1
+physicalai==0.3.0
+pillow>=10,<12

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam-labs:openvino-physicalai",
+  "visibility": "public",
+  "url": "https://github.com/viam-labs/viam-openvino-physicalai",
+  "description": "Serve OpenVINO ACT policies trained with Intel's physicalai over the viam-labs:vla policy protocol.",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:openvino-physicalai:policy",
+      "short_description": "OpenVINO ACT inference speaking the viam-labs:vla:policy DoCommand protocol",
+      "markdown_link": "README.md#policy-module"
+    }
+  ],
+  "entrypoint": "run.sh",
+  "first_run": "setup.sh",
+  "build": {
+    "build": "bash build.sh",
+    "path": "module.tar.gz",
+    "arch": ["linux/amd64"]
+  }
+}
