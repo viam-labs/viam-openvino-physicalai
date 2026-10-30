@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 
 import numpy as np
@@ -247,3 +248,26 @@ async def test_reconfigure_during_load_discards_first_load(tmp_path):
     await asyncio.sleep(0.5)
     status = await svc.do_command({"command": "status"})
     assert status["state"] == "failed" and "viam.json" in status["error"]
+
+
+REAL_MODEL = os.environ.get("PHYSICALAI_TEST_MODEL")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not REAL_MODEL, reason="set PHYSICALAI_TEST_MODEL to an exported model directory")
+async def test_real_model_serves_a_chunk():
+    svc = PhysicalAIPolicy("policy")
+    attrs = {"model_path": REAL_MODEL, "device": "CPU", "warmup_inferences": 1}
+    svc.reconfigure(ServiceConfig(name="policy", attributes=dict_to_struct(attrs)), {})
+    await svc._load_task
+    assert (await svc.do_command({"command": "status"}))["state"] == "ready"
+    specs = await svc.do_command({"command": "specs"})
+    images = {
+        key: encode_image(np.zeros((*specs["input_features"][key][1:], 3), np.uint8), encoding="jpeg")
+        for key in specs["image_feature_keys"]
+    }
+    out = await svc.do_command(
+        {"command": "infer", "images": images, "state": {"values": [0.0] * specs["state_dim"]}}
+    )
+    rows = np.array(out["actions"]["rows"])
+    assert rows.shape == (specs["n_action_steps"], specs["action_dim"]) and np.isfinite(rows).all()
