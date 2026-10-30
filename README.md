@@ -1,4 +1,9 @@
-# physical-ai-studio: Viam custom training script
+# OpenVINO physicalai for Viam
+
+Two parts: a Viam custom training script (`physical-ai-studio/`) and a Viam module
+(`viam-labs:openvino-physicalai`) that serves the trained models. See [Policy module](#policy-module).
+
+## physical-ai-studio: Viam custom training script
 
 Trains an [Intel Physical AI Studio](https://github.com/open-edge-platform/physical-ai-studio)
 ACT policy from a Viam **sequence dataset**. The resulting Viam model version
@@ -85,3 +90,79 @@ Re-uploading the script? Bump `--version` on upload and submit together.
 Run the job in the dataset's org: reading another org's images fails with
 `OSError: [Errno 5] Input/output error` on `/gcs/...`. Cloud jobs copy the images to local disk with the Cloud Storage transfer manager
 before converting; reading them through the `/gcs` mount took hours for 70k images.
+
+## Policy module
+
+The `viam-labs:openvino-physicalai:policy` generic service runs a model trained above with OpenVINO and
+answers the `viam-labs:vla:policy` DoCommand protocol. Pair it with `viam-labs:vla:controller`, which owns
+the cameras, the arm, scheduling and safety.
+
+| attribute | default | meaning |
+|---|---|---|
+| `model_path` | required | directory holding `viam.json` and the OpenVINO export |
+| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU` |
+| `warmup_inferences` | `2` | throwaway inferences after loading |
+| `load_timeout_s` | `600` | give up loading after this long |
+
+Deploy the trained model as an ML model package and point `model_path` at it. viam-server replaces
+`${packages.ml_model.<package-name>}` with the package's absolute local path before the module sees the config.
+The package must be in (or public to) the machine's org.
+
+```json
+{
+  "packages": [{"name": "box-opener-act", "package": "<org-id>/box-opener-act", "type": "ml_model", "version": "4"}],
+  "services": [{
+    "name": "policy", "api": "rdk:service:generic", "model": "viam-labs:openvino-physicalai:policy",
+    "attributes": {"model_path": "${packages.ml_model.box-opener-act}", "device": "NPU"}
+  }]
+}
+```
+
+Loading runs in the background (compiling for an NPU or GPU can take a while); poll `status` until it is `ready`.
+
+DoCommands (`{"command": ...}`):
+
+| command | returns |
+|---|---|
+| `status` | `state` (`idle`, `loading`, `ready` or `failed`) and `error` |
+| `specs` | the vla specs fields, plus `cameras` (feature key to camera component) and `arm` taken from `viam.json` |
+| `infer` | `actions` and `raw_actions` (the same for ACT) from `images`, `state` and optional `task` |
+| `reset` | clears the model's internal state |
+
+RTC is not supported (`specs.supports_rtc` is false).
+
+### Controller config
+
+Map each key in the policy's `specs.cameras` to its camera component. For the box-opener model:
+
+```json
+{
+  "policy_service": "policy", "arm": "xarm",
+  "cameras": {"images.realsense_cam": "realsense-cam", "images.camera_transform": "camera-transform"},
+  "state_joint_indices": [0, 1, 2, 3, 4, 5],
+  "task": "open the box"
+}
+```
+
+`state_joint_indices` is `[0 .. state_dim-1]`. Units are degrees, the controller's default.
+
+### Latency
+
+Raw graph, one inference on a NUC:
+
+| device | latency |
+|---|---|
+| GPU | 2.48 ms |
+| NPU | 3.79 ms |
+| CPU | 83.7 ms |
+
+### Development
+
+```sh
+uv venv .venv --python 3.12 && VIRTUAL_ENV=.venv uv pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/test_wire.py tests/test_policy.py tests/test_build.py -q
+```
+
+Set `PHYSICALAI_TEST_MODEL` to a model package directory to run the integration test. Try the module on a
+machine with `viam module reload --part-id <part-id>`. To publish, create a GitHub release; the workflow in
+`.github/workflows/deploy.yml` builds it in Viam's cloud build.
