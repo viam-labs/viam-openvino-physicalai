@@ -209,6 +209,7 @@ class PhysicalAIPolicy(Generic, EasyResource):
     async def close(self) -> None:
         self._closed = True
         if self._load_task and not self._load_task.done():
+            LOGGER.warning("close() while loading %s: the load thread keeps running until it finishes", self.name)
             # The worker thread cannot be interrupted; this only stops waiting on it.
             self._load_task.cancel()
         self._model = None

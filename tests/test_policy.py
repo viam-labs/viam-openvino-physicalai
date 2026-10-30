@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 
 import numpy as np
 import pytest
@@ -188,7 +190,6 @@ async def test_model_construction_error_reports_status(tmp_path):
 
 async def test_load_timeout_reports_status(tmp_path):
     def slow(path, device):
-        import time
         time.sleep(0.5)
         return FakeModel(path, device)
 
@@ -210,3 +211,39 @@ def test_validate_config_rejects_bad_device():
     cfg = ServiceConfig(name="policy", attributes=dict_to_struct({"model_path": "/m", "device": "TPU"}))
     with pytest.raises(ConfigError, match="device"):
         PhysicalAIPolicy.validate_config(cfg)
+
+
+async def test_infer_layout_scaling_and_encodings(tmp_path):
+    FakeModel.instances.clear()
+    svc = await make_policy(tmp_path, warmup_inferences=0)
+    img = np.zeros((8, 16, 3), np.uint8)
+    img[0, 0] = (255, 0, 51)
+    request = infer_request(state={"values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]})
+    request["images"]["images.cam_a"] = encode_image(img, encoding="raw")
+    request["images"]["images.cam_b"] = encode_image(np.zeros((16, 8, 3), np.uint8), encoding="png")
+    await svc.do_command(request)
+    batch = FakeModel.instances[-1].batches[-1]
+    np.testing.assert_allclose(batch["images.cam_a"][0, :, 0, 0], [1.0, 0.0, 0.2], atol=1e-6)
+    assert not batch["images.cam_a"][0, :, 1, 0].any()
+    np.testing.assert_array_equal(batch["state"][0], [1, 2, 3, 4, 5, 6])
+
+
+async def test_infer_refused_before_ready(tmp_path):
+    svc = await make_policy(tmp_path, model_path=str(tmp_path / "missing"))
+    with pytest.raises(RuntimeError, match="not ready"):
+        await svc.do_command(infer_request())
+
+
+async def test_reconfigure_during_load_discards_first_load(tmp_path):
+    def slow(path, device):
+        time.sleep(0.3)
+        return FakeModel(path, device)
+
+    svc = await make_policy(tmp_path, factory=slow)
+    svc.reconfigure(
+        ServiceConfig(name="policy", attributes=dict_to_struct({"model_path": str(tmp_path / "missing")})), {}
+    )
+    await svc._load_task
+    await asyncio.sleep(0.5)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed" and "viam.json" in status["error"]
