@@ -51,14 +51,14 @@ docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work \
 
 `viam training-script test-local` does not support sequence datasets.
 
-Build a local `<image>` with `docker buildx build --platform linux/amd64 --build-arg CONVERTER_REF=<commit> -t viam-openvino-physicalai:dev --load .`
+Build a local `<image>` with `docker buildx build --platform linux/amd64 -f container/Dockerfile --build-arg CONVERTER_REF=<commit> -t viam-openvino-physicalai:dev --load .`
 
-Tests: `docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work -e PYTHONPATH=/work/physical-ai-studio <image> python3 -m pytest tests -q`
+Tests: `docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work -e PYTHONPATH=/work/physical-ai-studio <image> python3 -m pytest tests/test_training.py -q`
 
 ## 4. Build and register the container
 
 ```sh
-docker buildx build --platform linux/amd64 --build-arg CONVERTER_REF=<commit> \
+docker buildx build --platform linux/amd64 -f container/Dockerfile --build-arg CONVERTER_REF=<commit> \
   -t docker.io/<user>/viam-openvino-physicalai:0.3.0-<n> --push .
 viam train containers register --uri=docker.io/<user>/viam-openvino-physicalai:0.3.0-<n> \
   --description="physicalai-train 0.3.0" --org-id=<org>
