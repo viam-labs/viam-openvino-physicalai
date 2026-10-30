@@ -33,9 +33,10 @@ PARQUET_FILES = ("sequences.parquet", "tabular_data.parquet", "binary_data.parqu
 # --vcodec auto tries these in order and uses the first that can actually encode here:
 # lerobot's own auto picks NVENC whenever FFmpeg lists it, even where opening it fails.
 VCODEC_CANDIDATES = ("h264_nvenc", "h264", "libsvtav1")
-# Cloud Storage transfer-manager processes for copying /gcs/ images to local disk.
+# Cloud Storage transfer-manager threads for copying /gcs/ images to local disk. A process pool
+# hung on Viam, likely from forking after av, torch and google-auth had started threads.
 DOWNLOAD_WORKERS = 24
-DOWNLOAD_BATCH = 5000
+DOWNLOAD_BATCH = 1000
 
 
 def unquote(value: str) -> str:
@@ -147,7 +148,7 @@ def download_images(paths: list[str], dest: Path) -> list[str]:
                 buckets[bucket] = client.bucket(bucket)
             pairs.append((buckets[bucket].blob(name), dst))
         transfer_manager.download_many(
-            pairs, max_workers=DOWNLOAD_WORKERS, worker_type=transfer_manager.PROCESS, raise_exception=True
+            pairs, max_workers=DOWNLOAD_WORKERS, worker_type=transfer_manager.THREAD, raise_exception=True
         )
         logger.info("Copied %d/%d images from /gcs in %ds", k + len(pairs), len(paths), time.monotonic() - start)
     return local
