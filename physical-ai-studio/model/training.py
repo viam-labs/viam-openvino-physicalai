@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import glob
+import io
 import json
 import logging
 import os
@@ -29,6 +30,12 @@ DATASET_REPO_ID = "viam/dataset"
 POLICIES = ("act",)
 # Names the converter's load_export() requires, in Viam's argument order below.
 PARQUET_FILES = ("sequences.parquet", "tabular_data.parquet", "binary_data.parquet")
+# --vcodec auto tries these in order and uses the first that can actually encode here:
+# lerobot's own auto picks NVENC whenever FFmpeg lists it, even where opening it fails.
+VCODEC_CANDIDATES = ("h264_nvenc", "h264", "libsvtav1")
+# Cloud Storage transfer-manager processes for copying /gcs/ images to local disk.
+DOWNLOAD_WORKERS = 24
+DOWNLOAD_BATCH = 5000
 
 
 def unquote(value: str) -> str:
@@ -58,7 +65,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy", choices=POLICIES, default="act")
     parser.add_argument("--fps", type=int, default=10, help="must match the capture frequency_hz")
     parser.add_argument("--image_size", type=int, default=None, help="downscale longest image side")
-    parser.add_argument("--vcodec", default="auto", help="libsvtav1 if hardware encoding fails")
+    parser.add_argument(
+        "--vcodec", default="auto", help="auto: first of " + ", ".join(VCODEC_CANDIDATES) + " that works here"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="conversion processes (default: half the cores with --image_size, else the converter's choice)",
+    )
     parser.add_argument("--task", type=unquote, default=None, help="instruction for sequences without a cmd: tag")
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -84,8 +97,10 @@ def resolve_export_dir(args: argparse.Namespace, work: Path) -> Path:
 
     A local `viam dataset export` already has them together, next to binary_data/,
     and its relative image paths only resolve against that directory, so it is
-    used as-is. Otherwise (a cloud job) the files are symlinked into work/export,
-    which is only safe because cloud image paths are absolute (/gcs/...).
+    used as-is. Otherwise (a cloud job) the files are staged in work/export, which is
+    only safe because cloud image paths are absolute (/gcs/...). Images under /gcs/ are
+    first copied to local disk: the converter checks and reads each one in turn, a
+    network round trip apiece through the mount, which took hours for 70k images.
     """
     given = (args.sequences_file, args.tabular_data_file, args.binary_data_file)
     files = dict(zip(PARQUET_FILES, given))
@@ -102,8 +117,64 @@ def resolve_export_dir(args: argparse.Namespace, work: Path) -> Path:
     stage = work / "export"
     stage.mkdir()
     for name, path in files.items():
-        (stage / name).symlink_to(path.resolve())
+        if name == "binary_data.parquet" and any(p.startswith("/gcs/") for p in image_paths):
+            table = pq.read_table(path)
+            local = download_images(image_paths, work / "images")
+            pq.write_table(table.set_column(table.schema.get_field_index("path"), "path", [local]), stage / name)
+        else:
+            (stage / name).symlink_to(path.resolve())
     return stage
+
+
+def download_images(paths: list[str], dest: Path) -> list[str]:
+    """Copy /gcs/<bucket>/<object> images to dest with the Cloud Storage transfer manager."""
+    from google.cloud import storage
+    from google.cloud.storage import transfer_manager
+
+    try:
+        client = storage.Client()
+    except OSError:  # no project in the environment; downloads don't need one
+        client = storage.Client(project="unused")
+    dest.mkdir()
+    local = [str(dest / f"{i:07d}{Path(p).suffix}") for i, p in enumerate(paths)]
+    buckets = {}
+    start = time.monotonic()
+    for k in range(0, len(paths), DOWNLOAD_BATCH):
+        pairs = []
+        for src, dst in zip(paths[k:k + DOWNLOAD_BATCH], local[k:k + DOWNLOAD_BATCH]):
+            _, _, bucket, name = src.split("/", 3)
+            if bucket not in buckets:
+                buckets[bucket] = client.bucket(bucket)
+            pairs.append((buckets[bucket].blob(name), dst))
+        transfer_manager.download_many(
+            pairs, max_workers=DOWNLOAD_WORKERS, worker_type=transfer_manager.PROCESS, raise_exception=True
+        )
+        logger.info("Copied %d/%d images from /gcs in %ds", k + len(pairs), len(paths), time.monotonic() - start)
+    return local
+
+
+def choose_vcodec(requested: str) -> str:
+    """Resolve auto to the first candidate codec that can encode a few frames here."""
+    if requested != "auto":
+        return requested
+    import av
+    import numpy as np
+
+    for codec in VCODEC_CANDIDATES:
+        try:
+            with av.open(io.BytesIO(), mode="w", format="mp4") as out:
+                stream = out.add_stream(codec, rate=10)
+                stream.width, stream.height, stream.pix_fmt = 64, 64, "yuv420p"
+                frame = av.VideoFrame.from_ndarray(np.zeros((64, 64, 3), np.uint8), format="rgb24")
+                for _ in range(3):
+                    out.mux(stream.encode(frame))
+                out.mux(stream.encode())
+        except Exception as exc:  # any failure means "not usable here"
+            logger.info("Video codec %s unusable here: %s", codec, exc)
+            continue
+        logger.info("Video codec: %s", codec)
+        return codec
+    raise SystemExit("No usable video codec among " + ", ".join(VCODEC_CANDIDATES))
 
 
 def check_components(args: argparse.Namespace, export_dir: Path) -> None:
@@ -148,6 +219,7 @@ def convert_dataset(args: argparse.Namespace, export_dir: Path, dataset_root: Pa
             fps=args.fps,
             image_size=args.image_size,
             vcodec=args.vcodec,
+            workers=args.workers,
         )
     )
 
@@ -168,7 +240,9 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     datamodule = LeRobotDataModule(
         repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
     )
-    policy = ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps)
+    # ACT letterboxes frames to image_size; its default (384) would pad 224px frames back up.
+    size = {"image_size": (args.image_size, args.image_size)} if args.image_size else {}
+    policy = ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps, **size)
     # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
     # script per rank (re-converting, and every rank exporting to out).
     trainer = Trainer(
@@ -276,6 +350,10 @@ def main(argv: list[str] | None = None) -> None:
             os.environ.get("LD_LIBRARY_PATH"),
             libcuda,
         )
+    args.vcodec = choose_vcodec(args.vcodec)
+    if args.workers is None and args.image_size:
+        # Downscaled frames make one encoder cheap; decoding the full-size JPEGs is the bottleneck.
+        args.workers = max(1, (os.cpu_count() or 2) // 2)
     # Up front: a missing package must not throw away a finished training run.
     versions = {
         name: package_version(name)

@@ -29,6 +29,7 @@ RUN test -n "$CONVERTER_REF" \
         torch==2.11.0 torchvision==0.26.0 torchcodec==0.11.1 \
         "nvidia-npp-cu12==12.3.3.*" \
         "viam-sequence-to-lerobot @ git+https://github.com/viam-labs/viam-sequence-to-lerobot@${CONVERTER_REF}" \
+        "google-cloud-storage>=2.14" \
         pytest
 
 # ACT's ResNet18 backbone weights, so jobs don't download them on GPU time.

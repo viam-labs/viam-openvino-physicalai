@@ -28,8 +28,9 @@ each sequence becomes one training episode. Add the sequences to a sequence data
 | `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`) |
 | `policy` | `act` | only `act` for now |
 | `fps` | `10` | must match the capture `frequency_hz` |
-| `image_size` | unset | downscale the longest image side |
-| `vcodec` | `auto` | set `libsvtav1` on Viam cloud GPUs (NVENC is not permitted there) and locally |
+| `image_size` | unset | downscale the longest image side; also ACT's input size. `224` makes jobs much faster |
+| `vcodec` | `auto` | `auto` uses the first of `h264_nvenc`, `h264`, `libsvtav1` that can encode on the machine |
+| `workers` | half the cores with `image_size` | conversion processes; otherwise the converter's choice |
 | `task` | unset | instruction for sequences without a `cmd:` tag |
 | `max_epochs` | `100` | |
 | `batch_size` | `8` | |
@@ -45,11 +46,8 @@ docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work \
   -e PYTHONPATH=/work/physical-ai-studio <image> python3 -m model.training \
   --binary_data_file=export/binary_data.parquet --tabular_data_file=export/tabular_data.parquet \
   --sequences_file=export/sequences.parquet --model_output_directory=out \
-  --arm=follower-arm --cameras="overhead-cam wrist-cam" --vcodec=libsvtav1 --max_epochs=1
+  --arm=follower-arm --cameras="overhead-cam wrist-cam" --image_size=224 --max_epochs=1
 ```
-
-Locally, pass `--vcodec=libsvtav1`. Without an NVIDIA GPU, lerobot's `auto` still
-picks `h264_nvenc` on Linux and fails to open it.
 
 `viam training-script test-local` does not support sequence datasets.
 
@@ -78,12 +76,12 @@ viam training-script upload --path=physical-ai-studio.tar.gz --org-id=<org> \
 viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
   --model-name=<name> --model-version=1 --version=1 \
   --script-name=<org-id>:physical-ai-studio --container-id=<container-id> \
-  --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",vcodec=libsvtav1
+  --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",image_size=224
 viam train logs --job-id=<job-id>
 ```
 
 Re-uploading the script? Bump `--version` on upload and submit together.
 
 Run the job in the dataset's org: reading another org's images fails with
-`OSError: [Errno 5] Input/output error` on `/gcs/...`. Images load through `/gcs`
-slowly (~70k images took about 2 hours), so expect a long wait before training starts.
+`OSError: [Errno 5] Input/output error` on `/gcs/...`. Cloud jobs copy the images to local disk with the Cloud Storage transfer manager
+before converting; reading them through the `/gcs` mount took hours for 70k images.

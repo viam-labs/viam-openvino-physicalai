@@ -13,7 +13,8 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from model.training import main, parse_args
+import model.training as training
+from model.training import VCODEC_CANDIDATES, choose_vcodec, main, parse_args, resolve_export_dir
 
 CAM, WRIST, ARM, LEADER = "overhead-cam", "wrist-cam", "follower-arm", "leader-arm"
 N_JOINTS, TICKS = 6, 15
@@ -190,3 +191,28 @@ def test_viam_quoted_values_are_unquoted(tmp_path):
     files = [f"--{arg}=x" for arg in ARG_FOR_FILE] + [f"--model_output_directory={tmp_path}"]
     args = parse_args(files + [f"--arm={ARM}", f"--cameras='{CAM} {WRIST}'", "--task='open the box'"])
     assert args.cameras == [CAM, WRIST] and args.task == "open the box"
+
+
+def test_gcs_images_are_staged_with_local_paths(tmp_path, monkeypatch):
+    export = build_export(tmp_path, [CAM], absolute=True)
+    table = pq.read_table(export / "binary_data.parquet")
+    gcs = [p.replace(str(export), "/gcs/bucket") for p in table.column("path").to_pylist()]
+    pq.write_table(table.set_column(table.schema.get_field_index("path"), "path", [gcs]),
+                   export / "binary_data.parquet")
+    seen = []
+    monkeypatch.setattr(training, "download_images", lambda paths, dest: seen.extend(paths) or
+                        [str(dest / f"{i}.jpeg") for i in range(len(paths))])
+    files = cloud_files(export)
+    args = parse_args([f"--{a}={p}" for a, p in files.items()] +
+                      [f"--model_output_directory={tmp_path / 'out'}", f"--arm={ARM}", f"--cameras={CAM}"])
+    (tmp_path / "work").mkdir()
+    stage = resolve_export_dir(args, tmp_path / "work")
+    assert seen == gcs
+    staged = pq.read_table(stage / "binary_data.parquet").column("path").to_pylist()
+    assert staged[0] == str(tmp_path / "work" / "images" / "0.jpeg") and len(staged) == len(gcs)
+
+
+def test_auto_vcodec_picks_a_codec_that_encodes():
+    assert choose_vcodec("libsvtav1") == "libsvtav1"
+    # No GPU in the test container, so NVENC fails to open and software H.264 wins.
+    assert choose_vcodec("auto") == "h264"
