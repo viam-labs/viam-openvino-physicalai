@@ -126,7 +126,7 @@ DoCommands (`{"command": ...}`):
 |---|---|
 | `status` | `state` (`idle`, `loading`, `ready` or `failed`) and `error` |
 | `specs` | the vla specs fields, plus `cameras` (feature key to camera component) and `arm` taken from `viam.json` |
-| `infer` | `actions` and `raw_actions` (the same for ACT) from `images`, `state` and optional `task` |
+| `infer` | `actions` and `raw_actions` (the same for ACT) from `images`, `state` and optional `task`, plus `latency_s` (decode and inference) |
 | `reset` | clears the model's internal state |
 
 RTC is not supported (`specs.supports_rtc` is false).
@@ -148,7 +148,8 @@ Map each key in the policy's `specs.cameras` to its camera component. For the bo
 
 ### Latency
 
-Raw graph, one inference on a NUC:
+Raw graph only (`benchmark_app` median), box-opener v4 with 384x384 graph inputs, on an Intel Core Ultra X7 358H NUC.
+`infer`'s `latency_s` adds image decoding and preprocessing; other models and input sizes will differ.
 
 | device | latency |
 |---|---|

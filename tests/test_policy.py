@@ -260,7 +260,8 @@ async def test_real_model_serves_a_chunk():
     attrs = {"model_path": REAL_MODEL, "device": "CPU", "warmup_inferences": 1}
     svc.reconfigure(ServiceConfig(name="policy", attributes=dict_to_struct(attrs)), {})
     await svc._load_task
-    assert (await svc.do_command({"command": "status"}))["state"] == "ready"
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "ready", status
     specs = await svc.do_command({"command": "specs"})
     images = {
         key: encode_image(np.zeros((*specs["input_features"][key][1:], 3), np.uint8), encoding="jpeg")
