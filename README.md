@@ -148,14 +148,15 @@ Map each key in the policy's `specs.cameras` to its camera component. For the bo
 
 ### Latency
 
-Raw graph only (`benchmark_app` median), box-opener v4 with 384x384 graph inputs, on an Intel Core Ultra X7 358H NUC.
-`infer`'s `latency_s` adds image decoding and preprocessing; other models and input sizes will differ.
+box-opener v4 (384x384 graph inputs) on an Intel Core Ultra X7 358H NUC. "Graph" is the OpenVINO
+`benchmark_app` median; "`infer`" is the median `latency_s` over 10 DoCommand calls with two real JPEG frames,
+which adds image decoding and InferenceModel's letterbox preprocessing. Other models and input sizes will differ.
 
-| device | latency |
-|---|---|
-| GPU | 2.48 ms |
-| NPU | 3.79 ms |
-| CPU | 83.7 ms |
+| device | graph | `infer` |
+|---|---|---|
+| GPU | 2.48 ms | 12 ms |
+| NPU | 3.79 ms | 15 ms |
+| CPU | 83.7 ms | 142 ms |
 
 ### Development
 
