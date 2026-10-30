@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import faulthandler
 import glob
 import io
 import json
@@ -109,6 +110,7 @@ def resolve_export_dir(args: argparse.Namespace, work: Path) -> Path:
     if len(parents) == 1 and all(path.name == name for name, path in files.items()):
         return parents.pop()
 
+    logger.info("Reading image paths from %s", args.binary_data_file)
     image_paths = pq.read_table(args.binary_data_file, columns=["path"]).column("path").to_pylist()
     if any(not path.startswith("/") for path in image_paths):
         raise SystemExit(
@@ -136,8 +138,16 @@ def download_images(paths: list[str], dest: Path) -> list[str]:
         client = storage.Client()
     except OSError:  # no project in the environment; downloads don't need one
         client = storage.Client(project="unused")
+    logger.info("Copying %d images from /gcs as %s (project %s)",
+                len(paths), type(client._credentials).__name__, client.project)
     dest.mkdir()
     local = [str(dest / f"{i:07d}{Path(p).suffix}") for i, p in enumerate(paths)]
+    # One download without retries first: an auth or permission problem otherwise hides
+    # behind per-file retries until a whole batch finishes, which can take an hour.
+    _, _, bucket, name = paths[0].split("/", 3)
+    probe = time.monotonic()
+    client.bucket(bucket).blob(name).download_to_filename(local[0], timeout=30, retry=None)
+    logger.info("Copied the first image in %.1fs", time.monotonic() - probe)
     buckets = {}
     start = time.monotonic()
     for k in range(0, len(paths), DOWNLOAD_BATCH):
@@ -330,6 +340,8 @@ def write_manifest(
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # Every thread's stack to stderr every 10 minutes, so a cloud job that goes quiet shows where.
+    faulthandler.dump_traceback_later(600, repeat=True)
     start = time.monotonic()
     import torch
 
