@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import math
 import time
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar, Mapping, Self, Sequence
 
 import numpy as np
+from viam.logging import getLogger
 from viam.proto.app.robot import ServiceConfig
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
@@ -25,7 +25,7 @@ from viam.utils import struct_to_dict
 
 from .wire import WireError, decode_image, decode_vector, encode_matrix
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = getLogger(__name__)  # viam's logger: stdlib loggers never reach viam-server
 
 DEVICES = ("AUTO", "NPU", "GPU", "CPU")
 
