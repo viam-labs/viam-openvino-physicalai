@@ -12,4 +12,4 @@ fi
 uv venv --python 3.12 --allow-existing "$VENV"
 VIRTUAL_ENV="$VENV" uv pip install -q -r requirements.txt
 # Fail here, not at the first reconfigure: policy.py imports physicalai lazily.
-"$VENV/bin/python" -c "import physicalai.inference, openvino; print('setup.sh: physicalai', openvino.__version__, 'OK')"
+"$VENV/bin/python" -c "import physicalai.inference, openvino, onnxruntime; print('setup.sh: physicalai', openvino.__version__, 'onnxruntime', onnxruntime.__version__, 'OK')"

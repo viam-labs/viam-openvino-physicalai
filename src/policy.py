@@ -1,4 +1,4 @@
-"""viam-labs:openvino-physicalai:policy — OpenVINO ACT inference over the viam-labs:vla policy protocol.
+"""viam-labs:openvino-physicalai:policy — OpenVINO or ONNX ACT inference over the viam-labs:vla policy protocol.
 
 The vla controller (viam-labs/vla-inference-service) owns cameras, the arm, scheduling and
 safety; this service only answers its status/specs/infer/reset DoCommands.
@@ -28,6 +28,7 @@ from .wire import WireError, decode_image, decode_vector, encode_matrix
 LOGGER = getLogger(__name__)  # viam's logger: stdlib loggers never reach viam-server
 
 DEVICES = ("AUTO", "NPU", "GPU", "CPU")
+FORMATS = ("openvino", "onnx")
 
 
 class ConfigError(ValueError):
@@ -58,7 +59,7 @@ class PolicyConfig:
     def parse(attrs: dict[str, Any]) -> PolicyConfig:
         path = attrs.get("model_path")
         if not isinstance(path, str) or not path:
-            raise ConfigError("model_path is required: a directory holding viam.json and the OpenVINO export")
+            raise ConfigError("model_path is required: a directory holding viam.json and the OpenVINO or ONNX export")
         device = attrs.get("device", "AUTO")
         if device not in DEVICES:
             raise ConfigError(f"device must be one of {DEVICES}, got {device!r}")
@@ -78,6 +79,8 @@ class Package:
     specs: dict[str, Any]
     state_input: str
     default_task: str
+    format: str
+    device: str  # what the model is compiled for: the configured device, or CPU for ONNX
 
 
 def read_package(path: Path | str, *, device: str) -> Package:
@@ -91,6 +94,14 @@ def read_package(path: Path | str, *, device: str) -> Package:
         raise LoadError(f"unsupported viam.json schema_version {meta.get('schema_version')!r} (expected 1)")
     if meta.get("policy") != "act":
         raise LoadError(f"unsupported policy {meta.get('policy')!r} (only act)")
+    fmt = meta.get("format", "openvino")  # packages trained before ONNX support have no format
+    if fmt not in FORMATS:
+        raise LoadError(f"unsupported format {fmt!r} (expected one of {FORMATS})")
+    if fmt == "onnx":
+        # The module's onnxruntime is the CPU build; physicalai would map GPU to CUDA and NPU to CPU silently.
+        if device not in ("AUTO", "CPU"):
+            raise LoadError(f"device {device} unavailable: ONNX packages run on CPU only (use AUTO or CPU)")
+        device = "CPU"
     try:
         cameras = [(c["input"], [int(n) for n in c["shape"]], c["component"]) for c in meta["cameras"]]
         state, action = meta["state"], meta["action"]
@@ -118,16 +129,18 @@ def read_package(path: Path | str, *, device: str) -> Package:
             "arm": action["component"],
         }
         tasks = meta.get("tasks") or [""]
-        return Package(specs=specs, state_input=state["input"], default_task=tasks[0])
+        return Package(
+            specs=specs, state_input=state["input"], default_task=tasks[0], format=fmt, device=device
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise LoadError(f"invalid viam.json in {path}: {type(exc).__name__}: {exc}") from exc
 
 
-def _inference_model(path: str, device: str) -> Any:
-    # Imported here so config validation and the protocol tests never load OpenVINO.
+def _inference_model(path: str, device: str, backend: str) -> Any:
+    # Imported here so config validation and the protocol tests never load OpenVINO or onnxruntime.
     from physicalai.inference import InferenceModel
 
-    return InferenceModel(path, backend="openvino", device=device)
+    return InferenceModel(path, backend=backend, device=device)
 
 
 def _require_dict(value: Any, field: str) -> dict[str, Any]:
@@ -142,7 +155,7 @@ class PhysicalAIPolicy(Generic, EasyResource):
     def __init__(self, name: str):
         super().__init__(name)
         # Tests inject a fake with InferenceModel's predict_action_chunk/reset.
-        self._model_factory: Callable[[str, str], Any] = _inference_model
+        self._model_factory: Callable[[str, str, str], Any] = _inference_model
         self._model: Any = None
         self._package: Package | None = None
         self._state, self._error = "idle", ""
@@ -181,13 +194,13 @@ class PhysicalAIPolicy(Generic, EasyResource):
             self._state, self._error = "failed", f"{type(exc).__name__}: {exc}"
         else:
             self._package, self._model, self._state = package, model, "ready"
-            LOGGER.info("policy ready on %s: %s", cfg.device, package.specs)
+            LOGGER.info("policy ready on %s (%s): %s", package.device, package.format, package.specs)
             return
         LOGGER.error("policy load failed: %s", self._error)
 
     def _load_sync(self, cfg: PolicyConfig) -> tuple[Package, Any]:
         package = read_package(cfg.model_path, device=cfg.device)
-        model = self._model_factory(cfg.model_path, cfg.device)
+        model = self._model_factory(cfg.model_path, package.device, package.format)
         # Throwaway inferences: the first calls on a freshly compiled model are slow.
         specs = package.specs
         images = {key: np.zeros((*specs["input_features"][key][1:], 3), np.uint8) for key in specs["image_feature_keys"]}

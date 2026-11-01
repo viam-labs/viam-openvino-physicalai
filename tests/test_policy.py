@@ -66,11 +66,12 @@ def test_read_package_builds_vla_specs(tmp_path):
     assert (s["device"], s["dtype"]) == ("NPU", "float32")
     assert s["cameras"] == {"images.cam_a": "cam-a", "images.cam_b": "cam-b"} and s["arm"] == "arm"
     assert (pkg.state_input, pkg.default_task) == ("state", "open the box")
+    assert (pkg.format, pkg.device) == ("openvino", "NPU")
 
 
 @pytest.mark.parametrize(
     "overrides, msg",
-    [({"schema_version": 2}, "schema_version"), ({"policy": "pi05"}, "policy"), ({"cameras": "x"}, "invalid")],
+    [({"schema_version": 2}, "schema_version"), ({"policy": "pi05"}, "policy"), ({"format": "torch"}, "format"), ({"cameras": "x"}, "invalid")],
 )
 def test_unsupported_package_raises(tmp_path, overrides, msg):
     with pytest.raises(LoadError, match=msg):
@@ -88,13 +89,25 @@ def test_malformed_viam_json_raises(tmp_path):
         read_package(tmp_path, device="CPU")
 
 
+@pytest.mark.parametrize("device", ["AUTO", "CPU"])
+def test_onnx_package_runs_on_cpu(tmp_path, device):
+    pkg = read_package(write_package(tmp_path / "m", format="onnx"), device=device)
+    assert (pkg.format, pkg.device, pkg.specs["device"]) == ("onnx", "CPU", "CPU")
+
+
+@pytest.mark.parametrize("device", ["GPU", "NPU"])
+def test_onnx_package_rejects_accelerators(tmp_path, device):
+    with pytest.raises(LoadError, match="CPU only"):
+        read_package(write_package(tmp_path / "m", format="onnx"), device=device)
+
+
 class FakeModel:
     """Stands in for physicalai's InferenceModel: records batches, returns a fixed chunk."""
 
     instances: list = []
 
-    def __init__(self, path, device):
-        self.path, self.device, self.batches, self.resets = path, device, [], 0
+    def __init__(self, path, device, backend):
+        self.path, self.device, self.backend, self.batches, self.resets = path, device, backend, [], 0
         FakeModel.instances.append(self)
 
     def predict_action_chunk(self, batch):
@@ -124,7 +137,16 @@ async def test_ready_after_load_with_warmups(tmp_path):
     svc = await make_policy(tmp_path, warmup_inferences=3)
     assert await svc.do_command({"command": "status"}) == {"state": "ready", "error": ""}
     model = FakeModel.instances[-1]
-    assert (model.path, model.device, len(model.batches)) == (str(tmp_path / "m"), "CPU", 3)
+    assert (model.path, model.device, model.backend, len(model.batches)) == (str(tmp_path / "m"), "CPU", "openvino", 3)
+
+
+async def test_onnx_package_loads_with_onnx_backend(tmp_path):
+    FakeModel.instances.clear()
+    onnx = write_package(tmp_path / "onnx", format="onnx")
+    svc = await make_policy(tmp_path, model_path=str(onnx), device="AUTO", warmup_inferences=0)
+    assert (await svc.do_command({"command": "status"}))["state"] == "ready"
+    model = FakeModel.instances[-1]
+    assert (model.path, model.device, model.backend) == (str(onnx), "CPU", "onnx")
 
 
 async def test_specs_and_reset(tmp_path):
@@ -181,7 +203,7 @@ async def test_load_failure_reports_status(tmp_path):
 
 
 async def test_model_construction_error_reports_status(tmp_path):
-    def broken(path, device):
+    def broken(path, device, backend):
         raise RuntimeError("NPU plugin not available")
 
     svc = await make_policy(tmp_path, factory=broken)
@@ -190,9 +212,9 @@ async def test_model_construction_error_reports_status(tmp_path):
 
 
 async def test_load_timeout_reports_status(tmp_path):
-    def slow(path, device):
+    def slow(path, device, backend):
         time.sleep(0.5)
-        return FakeModel(path, device)
+        return FakeModel(path, device, backend)
 
     svc = await make_policy(tmp_path, factory=slow, load_timeout_s=0.05)
     status = await svc.do_command({"command": "status"})
@@ -236,9 +258,9 @@ async def test_infer_refused_before_ready(tmp_path):
 
 
 async def test_reconfigure_during_load_discards_first_load(tmp_path):
-    def slow(path, device):
+    def slow(path, device, backend):
         time.sleep(0.3)
-        return FakeModel(path, device)
+        return FakeModel(path, device, backend)
 
     svc = await make_policy(tmp_path, factory=slow)
     svc.reconfigure(
