@@ -7,7 +7,8 @@ Two parts: a Viam custom training script (`physical-ai-studio/`) and a Viam modu
 
 Trains an [Intel Physical AI Studio](https://github.com/open-edge-platform/physical-ai-studio)
 ACT policy from a Viam **sequence dataset**. The resulting Viam model version
-contains the OpenVINO export (`act.xml`, `act.bin`, `manifest.json`) and
+contains the OpenVINO export (`act.xml`, `act.bin`, `manifest.json`), or the ONNX export
+(`act.onnx`, `act.onnx.data`, `manifest.json`) with `export_format=onnx`, and
 `viam.json`, which says which cameras and arm feed the policy and how to apply
 its actions.
 
@@ -32,6 +33,7 @@ each sequence becomes one training episode. Add the sequences to a sequence data
 | `cameras` | required | space-separated camera components; the first is the frame clock |
 | `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`) |
 | `policy` | `act` | only `act` for now |
+| `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only |
 | `fps` | `10` | must match the capture `frequency_hz` |
 | `image_size` | unset | downscale the longest image side; also ACT's input size. `224` makes jobs much faster |
 | `vcodec` | `auto` | `auto` uses the first of `h264_nvenc`, `h264`, `libsvtav1` that can encode on the machine |
@@ -93,14 +95,14 @@ before converting; reading them through the `/gcs` mount took hours for 70k imag
 
 ## Policy module
 
-The `viam-labs:openvino-physicalai:policy` generic service runs a model trained above with OpenVINO and
+The `viam-labs:openvino-physicalai:policy` generic service runs a model trained above with OpenVINO (or onnxruntime for ONNX exports) and
 answers the `viam-labs:vla:policy` DoCommand protocol. Pair it with `viam-labs:vla:controller`, which owns
 the cameras, the arm, scheduling and safety.
 
 | attribute | default | meaning |
 |---|---|---|
-| `model_path` | required | directory holding `viam.json` and the OpenVINO export |
-| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU` |
+| `model_path` | required | directory holding `viam.json` and the OpenVINO or ONNX export |
+| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU`; ONNX exports accept only `AUTO` or `CPU` |
 | `warmup_inferences` | `2` | throwaway inferences after loading |
 | `load_timeout_s` | `600` | give up loading after this long |
 
