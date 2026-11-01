@@ -96,6 +96,7 @@ def run(files: dict[str, Path], out: Path, **custom) -> None:
     [
         ({"max_epoch": 1}, "--max_epoch"),
         ({"policy": "pi05"}, "invalid choice: 'pi05'"),
+        ({"export_format": "torch"}, "invalid choice: 'torch'"),
         ({"chunk_size": 5, "n_action_steps": 10}, "--n_action_steps"),
         ({"action_source": ARM}, "--action_source"),
     ],
@@ -106,6 +107,13 @@ def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
         run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, **bad)
     assert exc.value.code == 2
     assert msg in capsys.readouterr().err
+
+
+def test_export_format_defaults_to_openvino(tmp_path):
+    base = [f"--{arg}={tmp_path / name}" for arg, name in ARG_FOR_FILE.items()]
+    base += [f"--model_output_directory={tmp_path / 'out'}", f"--arm={ARM}", f"--cameras={CAM}"]
+    assert parse_args(base).export_format == "openvino"
+    assert parse_args([*base, "--export_format=onnx"]).export_format == "onnx"
 
 
 def test_misspelled_camera_lists_present_components(tmp_path):
@@ -129,8 +137,10 @@ def test_staging_with_relative_image_paths_exits(tmp_path):
         run(cloud_files(export), tmp_path / "out", arm=ARM, cameras=CAM)
 
 
-@pytest.mark.parametrize("layout", ["local", "cloud"])
-def test_trains_exports_and_runs_inference(tmp_path, layout):
+@pytest.mark.parametrize(
+    "layout, export_format", [("local", "openvino"), ("cloud", "openvino"), ("local", "onnx")]
+)
+def test_trains_exports_and_runs_inference(tmp_path, layout, export_format):
     # local: one camera, relative paths, next-state actions.
     # cloud: two cameras, absolute paths, staged inputs, leader-arm actions.
     from physicalai.inference import InferenceModel
@@ -143,11 +153,15 @@ def test_trains_exports_and_runs_inference(tmp_path, layout):
     out = tmp_path / "out"
 
     run(files, out, arm=ARM, cameras=" ".join(cameras), action_source=action_source,
-        max_epochs=1, batch_size=2, vcodec="libsvtav1", chunk_size=10, n_action_steps=5)
+        max_epochs=1, batch_size=2, vcodec="libsvtav1", chunk_size=10, n_action_steps=5,
+        export_format=export_format)
 
-    assert (out / "act.xml").is_file() and (out / "manifest.json").is_file()
+    artifact = "act.onnx" if export_format == "onnx" else "act.xml"
+    assert (out / artifact).is_file() and (out / "manifest.json").is_file()
     manifest = json.loads((out / "viam.json").read_text())
     assert manifest["schema_version"] == 1 and manifest["policy"] == "act"
+    assert manifest["format"] == export_format
+    assert manifest["training"]["args"]["export_format"] == export_format
     assert [c["component"] for c in manifest["cameras"]] == cameras
     for cam in manifest["cameras"]:
         assert {k: cam[k] for k in ("dtype", "layout", "color", "range")} == {

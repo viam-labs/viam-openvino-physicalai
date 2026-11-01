@@ -1,4 +1,4 @@
-"""Viam custom training script: Viam sequence dataset -> LeRobot -> physicalai ACT -> OpenVINO.
+"""Viam custom training script: Viam sequence dataset -> LeRobot -> physicalai ACT -> OpenVINO or ONNX.
 
 Viam runs `python3 -m model.training` with the sequence-dataset file arguments
 plus custom `--key=value` arguments. Everything except tmp/ in
@@ -29,6 +29,8 @@ logger = logging.getLogger("physical-ai-studio")
 DATASET_REPO_ID = "viam/dataset"
 
 POLICIES = ("act",)
+# physicalai ExportBackend values offered here; ACT supports both.
+EXPORT_FORMATS = ("openvino", "onnx")
 # Names the converter's load_export() requires, in Viam's argument order below.
 PARQUET_FILES = ("sequences.parquet", "tabular_data.parquet", "binary_data.parquet")
 # --vcodec auto tries these in order and uses the first that can actually encode here:
@@ -65,6 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="next_state, or an arm component (e.g. a teleop leader) whose JointPositions is the action",
     )
     parser.add_argument("--policy", choices=POLICIES, default="act")
+    parser.add_argument("--export_format", choices=EXPORT_FORMATS, default="openvino")
     parser.add_argument("--fps", type=int, default=10, help="must match the capture frequency_hz")
     parser.add_argument("--image_size", type=int, default=None, help="downscale longest image side")
     parser.add_argument(
@@ -310,6 +313,7 @@ def write_manifest(
     manifest = {
         "schema_version": 1,
         "policy": args.policy,
+        "format": args.export_format,
         "fps": args.fps,
         "cameras": cameras,
         "image_size": args.image_size,
@@ -325,7 +329,8 @@ def write_manifest(
         "training": {
             "args": {"max_epochs": args.max_epochs, "batch_size": args.batch_size,
                      "chunk_size": args.chunk_size, "n_action_steps": args.n_action_steps,
-                     "vcodec": args.vcodec, "task": args.task},
+                     "vcodec": args.vcodec, "task": args.task,
+                     "export_format": args.export_format},
             "episodes": summary.episodes_written,
             "frames": summary.frames_written,
             "skipped_sequences": len(summary.skipped),
@@ -392,7 +397,7 @@ def main(argv: list[str] | None = None) -> None:
                 "binary_data/ sits next to the Parquet files."
             ) from exc
         policy, device = train(args, work / "dataset", work / "ckpt")
-        policy.export(out, backend="openvino")
+        policy.export(out, backend=args.export_format)
     manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)
     logger.info(
         "Done: %d episodes, %d frames, %d sequences skipped, device %s, %ds",
