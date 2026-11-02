@@ -8,7 +8,7 @@
     {
       "api": "rdk:service:generic",
       "model": "viam-labs:openvino-physicalai:policy",
-      "short_description": "OpenVINO ACT and SmolVLA, or ONNX (CPU) ACT, inference speaking the viam-labs:vla:policy DoCommand protocol",
+      "short_description": "OpenVINO ACT and SmolVLA or ONNX (CPU) ACT inference over the viam-labs:vla:policy protocol",
       "markdown_link": "README.md#policy-module"
     }
   ],
