@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import dataclasses
 import faulthandler
 import glob
 import io
@@ -28,7 +29,10 @@ logger = logging.getLogger("physical-ai-studio")
 # LeRobot dataset name; the converter and the datamodule must agree on it.
 DATASET_REPO_ID = "viam/dataset"
 
-POLICIES = ("act",)
+POLICIES = ("act", "smolvla")
+# ACT's library default; at 10 fps, 100 steps is ~10 s of open-loop actions. SmolVLA's chunk
+# size is fixed by its --pretrained checkpoint (50 for lerobot/smolvla_base).
+ACT_CHUNK_SIZE = 100
 # physicalai ExportBackend values offered here; ACT supports both.
 EXPORT_FORMATS = ("openvino", "onnx")
 # Names the converter's load_export() requires, in Viam's argument order below.
@@ -68,6 +72,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--policy", choices=POLICIES, default="act")
     parser.add_argument("--export_format", choices=EXPORT_FORMATS, default="openvino")
+    parser.add_argument(
+        "--pretrained", default="lerobot/smolvla_base",
+        help="smolvla only: checkpoint to fine-tune (Hugging Face id or local directory)",
+    )
+    parser.add_argument(
+        "--num_steps", type=int, default=10, help="smolvla only: flow-matching denoising steps per inference"
+    )
     parser.add_argument("--fps", type=int, default=10, help="must match the capture frequency_hz")
     parser.add_argument("--image_size", type=int, default=None, help="downscale longest image side")
     parser.add_argument(
@@ -80,20 +91,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task", type=unquote, default=None, help="instruction for sequences without a cmd: tag")
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
-    # ACT's library defaults; at 10 fps, 100 steps is ~10 s of open-loop actions.
-    parser.add_argument("--chunk_size", type=int, default=100, help="actions predicted per inference")
     parser.add_argument(
-        "--n_action_steps", type=int, default=None, help="actions executed per inference (default: chunk_size)"
+        "--chunk_size", type=int, default=None,
+        help=f"act only: actions predicted per inference (default {ACT_CHUNK_SIZE})",
+    )
+    parser.add_argument(
+        "--n_action_steps", type=int, default=None,
+        help="actions executed per inference (default: the chunk size)",
     )
     args = parser.parse_args(argv)
     if not args.cameras:
         parser.error("--cameras must name at least one camera component")
-    if args.n_action_steps is None:
-        args.n_action_steps = args.chunk_size
     if args.action_source == args.arm:
         parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
-    if not 1 <= args.n_action_steps <= args.chunk_size:
-        parser.error("--n_action_steps must be between 1 and --chunk_size")
+    if args.policy == "smolvla":
+        if args.chunk_size is not None:
+            parser.error("--chunk_size is fixed by the --pretrained checkpoint for smolvla; set --n_action_steps instead")
+        if args.export_format != "openvino":
+            parser.error("smolvla exports to openvino only")
+        if args.num_steps < 1:
+            parser.error("--num_steps must be at least 1")
+        # The upper bound is the checkpoint's chunk size, checked in check_checkpoint().
+        if args.n_action_steps is not None and args.n_action_steps < 1:
+            parser.error("--n_action_steps must be at least 1")
+    else:
+        if args.chunk_size is None:
+            args.chunk_size = ACT_CHUNK_SIZE
+        if args.n_action_steps is None:
+            args.n_action_steps = args.chunk_size
+        if not 1 <= args.n_action_steps <= args.chunk_size:
+            parser.error("--n_action_steps must be between 1 and --chunk_size")
     return args
 
 
@@ -239,10 +266,71 @@ def convert_dataset(args: argparse.Namespace, export_dir: Path, dataset_root: Pa
     )
 
 
+def feature_key(camera: str) -> str:
+    """The converter's camera_feature_key(): a camera's LeRobot image feature suffix."""
+    return camera.replace("-", "_").replace(".", "_")
+
+
+def checkpoint_config(pretrained: str) -> dict:
+    """A SmolVLA checkpoint's parsed config.json, from a local directory or the Hub."""
+    try:
+        local = Path(pretrained)
+        if local.is_dir():
+            config = local / "config.json"
+        else:
+            from huggingface_hub import hf_hub_download
+
+            config = Path(hf_hub_download(pretrained, "config.json"))
+        return json.loads(config.read_text())
+    except Exception as exc:
+        raise SystemExit(f"Cannot read config.json for --pretrained={pretrained}: {exc}") from exc
+
+
+def check_checkpoint(args: argparse.Namespace) -> None:
+    """Fail before the slow dataset conversion if the SmolVLA checkpoint or --n_action_steps is unusable."""
+    chunk = checkpoint_config(args.pretrained).get("chunk_size")
+    if not isinstance(chunk, int):
+        raise SystemExit(f"--pretrained={args.pretrained} config.json has no integer chunk_size: not a SmolVLA checkpoint?")
+    if args.n_action_steps is not None and args.n_action_steps > chunk:
+        raise SystemExit(f"--n_action_steps={args.n_action_steps} exceeds the {args.pretrained} chunk size ({chunk})")
+
+
+def build_policy(args: argparse.Namespace):
+    """Construct the untrained policy named by --policy."""
+    if args.policy == "act":
+        from physicalai.policies import ACT
+
+        # ACT letterboxes frames to image_size; its default (384) would pad 224px frames back up.
+        size = {"image_size": (args.image_size, args.image_size)} if args.image_size else {}
+        return ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps, **size)
+
+    from physicalai.policies import SmolVLA
+
+    keys = [feature_key(camera) for camera in args.cameras]
+    features = checkpoint_config(args.pretrained).get("input_features", {})
+    slots = sum(1 for feature in features.values() if feature.get("type") == "VISUAL")
+    policy = SmolVLA(
+        pretrained_name_or_path=args.pretrained,
+        num_steps=args.num_steps,
+        # --cameras fill the checkpoint's camera slots in order; unused slots are masked.
+        num_cameras=max(len(keys), slots),
+        # A single camera is exported as plain "images" and needs no map.
+        image_key_reorder_map={key: i for i, key in enumerate(keys)} if len(keys) > 1 else None,
+    )
+    # A pretrained SmolVLA ignores the constructor's chunk_size and n_action_steps: both come
+    # from the checkpoint. Its config is frozen, so n_action_steps is set by replacing it; the
+    # export then trims each chunk to it. Only policy.config (and so the export) gets the new
+    # n_action_steps; the base class's own select_action queue keeps the checkpoint default,
+    # which nothing here uses. The upper bound was checked up front by check_checkpoint().
+    chunk = policy.config.chunk_size
+    steps = args.n_action_steps or chunk
+    policy.config = dataclasses.replace(policy.config, n_action_steps=steps)
+    return policy
+
+
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     """Train the policy; return it and the device type it trained on."""
     from physicalai.data import LeRobotDataModule
-    from physicalai.policies import ACT
     from physicalai.train import Trainer
 
     # Docker's default 64 MB /dev/shm kills DataLoader workers with a bus error, and Viam
@@ -255,9 +343,7 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     datamodule = LeRobotDataModule(
         repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
     )
-    # ACT letterboxes frames to image_size; its default (384) would pad 224px frames back up.
-    size = {"image_size": (args.image_size, args.image_size)} if args.image_size else {}
-    policy = ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps, **size)
+    policy = build_policy(args)
     # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
     # script per rank (re-converting, and every rank exporting to out).
     trainer = Trainer(
@@ -283,8 +369,7 @@ def model_inputs(policy, cameras: list[str]) -> tuple[list[dict], dict]:
         if len(cameras) == 1 and image_inputs == [IMAGES]:
             name = IMAGES
         else:
-            safe = camera.replace("-", "_").replace(".", "_")  # converter's camera_feature_key()
-            matches = [n for n in image_inputs if n.endswith(f".{safe}")]
+            matches = [n for n in image_inputs if n.endswith(f".{feature_key(camera)}")]
             if len(matches) != 1:
                 raise RuntimeError(f"Cannot map camera {camera!r} to one exported input in {image_inputs}")
             name = matches[0]
@@ -310,6 +395,14 @@ def write_manifest(
     """Write viam.json: what the inference module needs beyond the export's manifest.json."""
     cameras, state = model_inputs(policy, args.cameras)
     dim = state["shape"][0]  # the converter guarantees action dim == state dim in joints mode
+    train_args = {
+        "max_epochs": args.max_epochs, "batch_size": args.batch_size,
+        # The trained policy's own values: SmolVLA's chunk size comes from its checkpoint.
+        "chunk_size": policy.config.chunk_size, "n_action_steps": policy.config.n_action_steps,
+        "vcodec": args.vcodec, "task": args.task, "export_format": args.export_format,
+    }
+    if args.policy == "smolvla":
+        train_args |= {"pretrained": args.pretrained, "num_steps": args.num_steps}
     manifest = {
         "schema_version": 1,
         "policy": args.policy,
@@ -327,10 +420,7 @@ def write_manifest(
         },
         "tasks": sorted(summary.tasks_written),
         "training": {
-            "args": {"max_epochs": args.max_epochs, "batch_size": args.batch_size,
-                     "chunk_size": args.chunk_size, "n_action_steps": args.n_action_steps,
-                     "vcodec": args.vcodec, "task": args.task,
-                     "export_format": args.export_format},
+            "args": train_args,
             "episodes": summary.episodes_written,
             "frames": summary.frames_written,
             "skipped_sequences": len(summary.skipped),
@@ -385,6 +475,8 @@ def main(argv: list[str] | None = None) -> None:
         work = Path(tmp)
         export_dir = resolve_export_dir(args, work)
         check_components(args, export_dir)
+        if args.policy == "smolvla":
+            check_checkpoint(args)
         try:
             summary = convert_dataset(args, export_dir, work / "dataset")
         except ValueError as exc:
@@ -396,6 +488,12 @@ def main(argv: list[str] | None = None) -> None:
                 f"{exc}\nIf every sequence reports 'no frames from camera', check that "
                 "binary_data/ sits next to the Parquet files."
             ) from exc
+        if args.policy == "act" and len(summary.tasks_written) > 1:
+            logger.warning(
+                "ACT ignores task text, so these %d tasks will blend into one behavior: %s. "
+                "Use --policy=smolvla to condition on the task.",
+                len(summary.tasks_written), "; ".join(sorted(summary.tasks_written)),
+            )
         policy, device = train(args, work / "dataset", work / "ckpt")
         policy.export(out, backend=args.export_format)
     manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)

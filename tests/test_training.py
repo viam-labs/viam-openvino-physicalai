@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,14 +37,15 @@ def _row(table: dict, seq: str, ts: datetime, component: str, method: str, **dat
         table[key].append(value)
 
 
-def build_export(root: Path, cameras: list[str], *, leader_joints=N_JOINTS, absolute=False) -> Path:
+def build_export(root: Path, cameras: list[str], *, leader_joints=N_JOINTS, absolute=False,
+                 tasks=("pick the cube", "pick the cube")) -> Path:
     """Write a two-sequence Viam sequence export (follower + leader arm, 10 Hz) and return its dir."""
     export = root / "export"
     seqs = ["seq-a", "seq-b"]
     starts = [BASE, BASE + timedelta(minutes=1)]
     sequences = {
         "sequence_id": seqs,
-        "tags": [["cmd:pick the cube"]] * 2,
+        "tags": [[f"cmd:{task}"] for task in tasks],
         "start_at": starts,
         "end_at": [s + timedelta(seconds=2) for s in starts],
     }
@@ -91,12 +93,22 @@ def run(files: dict[str, Path], out: Path, **custom) -> None:
     main(argv)
 
 
+def required_argv(tmp_path: Path) -> list[str]:
+    """Viam's file args plus the required custom args; parse_args doesn't open the files."""
+    argv = [f"--{arg}={tmp_path / name}" for arg, name in ARG_FOR_FILE.items()]
+    return argv + [f"--model_output_directory={tmp_path / 'out'}", f"--arm={ARM}", f"--cameras={CAM}"]
+
+
 @pytest.mark.parametrize(
     "bad, msg",
     [
         ({"max_epoch": 1}, "--max_epoch"),
         ({"policy": "pi05"}, "invalid choice: 'pi05'"),
         ({"export_format": "torch"}, "invalid choice: 'torch'"),
+        ({"policy": "smolvla", "chunk_size": 20}, "--chunk_size is fixed"),
+        ({"policy": "smolvla", "export_format": "onnx"}, "openvino only"),
+        ({"policy": "smolvla", "n_action_steps": 0}, "--n_action_steps must be at least 1"),
+        ({"policy": "smolvla", "num_steps": 0}, "--num_steps must be at least 1"),
         ({"chunk_size": 5, "n_action_steps": 10}, "--n_action_steps"),
         ({"action_source": ARM}, "--action_source"),
     ],
@@ -110,10 +122,18 @@ def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
 
 
 def test_export_format_defaults_to_openvino(tmp_path):
-    base = [f"--{arg}={tmp_path / name}" for arg, name in ARG_FOR_FILE.items()]
-    base += [f"--model_output_directory={tmp_path / 'out'}", f"--arm={ARM}", f"--cameras={CAM}"]
+    base = required_argv(tmp_path)
     assert parse_args(base).export_format == "openvino"
     assert parse_args([*base, "--export_format=onnx"]).export_format == "onnx"
+
+
+def test_chunk_defaults_per_policy(tmp_path):
+    act = parse_args(required_argv(tmp_path))
+    assert (act.chunk_size, act.n_action_steps) == (100, 100)
+    smol = parse_args([*required_argv(tmp_path), "--policy=smolvla"])
+    # SmolVLA's chunk size comes from its checkpoint, resolved in build_policy().
+    assert (smol.chunk_size, smol.n_action_steps) == (None, None)
+    assert (smol.pretrained, smol.num_steps) == ("lerobot/smolvla_base", 10)
 
 
 def test_misspelled_camera_lists_present_components(tmp_path):
@@ -175,6 +195,7 @@ def test_trains_exports_and_runs_inference(tmp_path, layout, export_format):
     assert manifest["tasks"] == ["pick the cube"]
     assert manifest["training"]["args"]["chunk_size"] == 10
     assert manifest["training"]["args"]["n_action_steps"] == 5
+    assert "pretrained" not in manifest["training"]["args"]
     frames_per_episode = TICKS if cloud else TICKS - 1  # next_state consumes the last tick
     assert manifest["training"]["episodes"] == 2
     assert manifest["training"]["frames"] == 2 * frames_per_episode
@@ -185,6 +206,51 @@ def test_trains_exports_and_runs_inference(tmp_path, layout, export_format):
     for cam in manifest["cameras"]:
         obs[cam["input"]] = np.zeros((1, *cam["shape"]), np.float32)
     assert model.select_action(obs).shape == (N_JOINTS,)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PHYSICALAI_TEST_SMOLVLA"),
+    reason="set PHYSICALAI_TEST_SMOLVLA=1: downloads lerobot/smolvla_base (~1 GB) and fine-tunes on CPU for minutes",
+)
+def test_smolvla_trains_exports_and_runs_inference(tmp_path):
+    from physicalai.inference import InferenceModel
+
+    export = build_export(tmp_path, [CAM, WRIST])
+    out = tmp_path / "out"
+    run(local_files(export), out, arm=ARM, cameras=f"{CAM} {WRIST}", policy="smolvla",
+        max_epochs=1, batch_size=8, vcodec="libsvtav1", n_action_steps=10)
+
+    assert (out / "smolvla.xml").is_file() and (out / "tokenizer.xml").is_file()
+    manifest = json.loads((out / "viam.json").read_text())
+    assert (manifest["policy"], manifest["format"]) == ("smolvla", "openvino")
+    assert [c["input"] for c in manifest["cameras"]] == ["images.overhead_cam", "images.wrist_cam"]
+    train_args = manifest["training"]["args"]
+    assert (train_args["chunk_size"], train_args["n_action_steps"]) == (50, 10)
+    assert (train_args["pretrained"], train_args["num_steps"]) == ("lerobot/smolvla_base", 10)
+    assert manifest["tasks"] == ["pick the cube"]
+
+    # The tokenizer is part of the export: the model takes the task as a string.
+    model = InferenceModel(out)
+    batch = {cam["input"]: np.zeros((1, *cam["shape"]), np.float32) for cam in manifest["cameras"]}
+    batch[manifest["state"]["input"]] = np.zeros((1, *manifest["state"]["shape"]), np.float32)
+    batch["task"] = ["pick the cube"]
+    assert np.asarray(model.predict_action_chunk(batch)).shape == (10, N_JOINTS)
+
+
+def test_check_checkpoint_rejects_oversized_n_action_steps(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(json.dumps({"chunk_size": 50, "input_features": {
+        "observation.state": {"type": "STATE"},
+        "observation.images.camera1": {"type": "VISUAL"},
+        "observation.images.camera2": {"type": "VISUAL"},
+    }}))
+    assert training.checkpoint_config(str(ckpt))["chunk_size"] == 50
+
+    base = [*required_argv(tmp_path), "--policy=smolvla", f"--pretrained={ckpt}"]
+    with pytest.raises(SystemExit, match="exceeds"):
+        training.check_checkpoint(parse_args([*base, "--n_action_steps=60"]))
+    assert training.check_checkpoint(parse_args([*base, "--n_action_steps=10"])) is None
 
 
 def test_zero_episodes_hints_at_export_layout(tmp_path):
@@ -232,3 +298,19 @@ def test_auto_vcodec_picks_a_codec_that_encodes():
     assert choose_vcodec("libsvtav1") == "libsvtav1"
     # No GPU in the test container, so NVENC fails to open and software H.264 wins.
     assert choose_vcodec("auto") == "h264"
+
+
+@pytest.mark.parametrize("tasks, warns", [
+    (("pick the cube", "pick the cube"), False),
+    (("pick the cube", "open the box"), True),
+])
+def test_act_warns_when_tasks_differ(tmp_path, monkeypatch, caplog, tasks, warns):
+    export = build_export(tmp_path, [CAM], tasks=tasks)
+
+    def stop(*_args):
+        raise SystemExit("stopped before training")
+
+    monkeypatch.setattr(training, "train", stop)
+    with caplog.at_level("WARNING", logger="physical-ai-studio"), pytest.raises(SystemExit, match="stopped"):
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, vcodec="libsvtav1")
+    assert ("ACT ignores task text" in caplog.text) == warns

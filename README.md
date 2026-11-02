@@ -6,11 +6,12 @@ Two parts: a Viam custom training script (`physical-ai-studio/`) and a Viam modu
 ## physical-ai-studio: Viam custom training script
 
 Trains an [Intel Physical AI Studio](https://github.com/open-edge-platform/physical-ai-studio)
-ACT policy from a Viam **sequence dataset**. The resulting Viam model version
+ACT or SmolVLA policy from a Viam **sequence dataset**. The resulting Viam model version
 contains the OpenVINO export (`act.xml`, `act.bin`, `manifest.json`), or the ONNX export
 (`act.onnx`, `act.onnx.data`, `manifest.json`) with `export_format=onnx`, and
 `viam.json`, which says which cameras and arm feed the policy and how to apply
-its actions.
+its actions. A SmolVLA model version holds `smolvla.xml`, `smolvla.bin`, `tokenizer.xml`,
+`tokenizer.bin` and `manifest.json` in place of the ACT files, plus `viam.json`.
 
 ## 1. Record demonstrations
 
@@ -25,6 +26,10 @@ Use the same frequency for all of them, e.g. 10 Hz. Call
 demonstration and `stop_capture` at the end. Each pair becomes one sequence, and
 each sequence becomes one training episode. Add the sequences to a sequence dataset.
 
+Give each task its own instruction, e.g. `cmd:open the box` and `cmd:close the box`. SmolVLA
+learns one policy that follows whichever instruction it is given; ACT ignores the text and
+blends every task into one behavior (the training job warns when that happens).
+
 ## 2. Custom arguments
 
 | arg | default | meaning |
@@ -32,8 +37,10 @@ each sequence becomes one training episode. Add the sequences to a sequence data
 | `arm` | required | follower arm component |
 | `cameras` | required | space-separated camera components; the first is the frame clock |
 | `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`) |
-| `policy` | `act` | only `act` for now |
-| `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only |
+| `policy` | `act` | or `smolvla`, a vision-language-action model conditioned on the task text |
+| `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only; smolvla is `openvino` only |
+| `pretrained` | `lerobot/smolvla_base` | smolvla only: checkpoint to fine-tune (Hugging Face id or directory). The job downloads it (about 1 GB for `smolvla_base`), so it needs Hugging Face access |
+| `num_steps` | `10` | smolvla only: denoising steps per inference |
 | `fps` | `10` | must match the capture `frequency_hz` |
 | `image_size` | unset | downscale the longest image side; also ACT's input size. `224` makes jobs much faster |
 | `vcodec` | `auto` | `auto` uses the first of `h264_nvenc`, `h264`, `libsvtav1` that can encode on the machine |
@@ -41,8 +48,8 @@ each sequence becomes one training episode. Add the sequences to a sequence data
 | `task` | unset | instruction for sequences without a `cmd:` tag |
 | `max_epochs` | `100` | |
 | `batch_size` | `8` | |
-| `chunk_size` | `100` | actions predicted per inference; 100 is about 10 s at 10 fps |
-| `n_action_steps` | `chunk_size` | actions executed before predicting again (≤ `chunk_size`); lower means the policy replans more often |
+| `chunk_size` | `100` | act only: actions predicted per inference; 100 is about 10 s at 10 fps. smolvla's is fixed by `pretrained` (50 for `smolvla_base`) |
+| `n_action_steps` | the chunk size | actions executed before predicting again (≤ the chunk size); lower means the policy replans more often |
 
 ## 3. Run locally
 
@@ -102,7 +109,7 @@ the cameras, the arm, scheduling and safety.
 | attribute | default | meaning |
 |---|---|---|
 | `model_path` | required | directory holding `viam.json` and the OpenVINO or ONNX export |
-| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU`; ONNX exports accept only `AUTO` or `CPU` |
+| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU`; ONNX exports accept only `AUTO` or `CPU`; for SmolVLA use `GPU` (`CPU` works but takes about 2 s per chunk; `NPU` is rejected because SmolVLA does not compile there) |
 | `warmup_inferences` | `2` | throwaway inferences after loading |
 | `load_timeout_s` | `600` | give up loading after this long |
 
@@ -146,6 +153,9 @@ Map each key in the policy's `specs.cameras` to its camera component. For the bo
 }
 ```
 
+For a SmolVLA model, pass the instruction per run: `{"command": "start", "task": "close the box"}`
+overrides the configured `task`. The package's `viam.json` lists the trained `tasks`.
+
 `state_joint_indices` is `[0 .. state_dim-1]`. Units are degrees, the controller's default.
 
 ### Latency
@@ -159,6 +169,10 @@ which adds image decoding and InferenceModel's letterbox preprocessing. Other mo
 | GPU | 2.48 ms | 12 ms |
 | NPU | 3.79 ms | 15 ms |
 | CPU | 83.7 ms | 142 ms |
+
+SmolVLA (`lerobot/smolvla_base`, not fine-tuned, three 256x256 cameras, 10 denoising steps, random
+inputs) on the same NUC, median `predict_action_chunk` over 10 calls: GPU 89 ms, CPU 1.9 s. It does
+not compile for the NPU.
 
 ### Development
 

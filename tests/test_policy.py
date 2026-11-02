@@ -78,6 +78,22 @@ def test_unsupported_package_raises(tmp_path, overrides, msg):
         read_package(write_package(tmp_path / "m", **overrides), device="CPU")
 
 
+SMOLVLA_TRAINING = {"args": {"chunk_size": 50, "n_action_steps": N_STEPS, "num_steps": 10}}
+
+
+def test_read_package_smolvla(tmp_path):
+    pkg = read_package(write_package(tmp_path / "m", policy="smolvla", training=SMOLVLA_TRAINING), device="GPU")
+    s = pkg.specs
+    assert (s["policy_type"], s["num_steps"], s["n_action_steps"], s["device"]) == ("smolvla", 10, N_STEPS, "GPU")
+
+
+@pytest.mark.parametrize("overrides, device, msg", [({}, "NPU", "NPU"), ({"format": "onnx"}, "CPU", "openvino")])
+def test_smolvla_package_rejects(tmp_path, overrides, device, msg):
+    path = write_package(tmp_path / "m", policy="smolvla", training=SMOLVLA_TRAINING, **overrides)
+    with pytest.raises(LoadError, match=msg):
+        read_package(path, device=device)
+
+
 def test_missing_viam_json_raises(tmp_path):
     with pytest.raises(LoadError, match="viam.json"):
         read_package(tmp_path, device="CPU")
@@ -161,13 +177,13 @@ async def test_specs_and_reset(tmp_path):
 async def test_infer_converts_inputs_and_returns_chunk(tmp_path):
     FakeModel.instances.clear()
     svc = await make_policy(tmp_path, warmup_inferences=0)
-    out = await svc.do_command(infer_request())
+    out = await svc.do_command(infer_request(task="close the box"))  # not the package default task
     rows = np.array(out["actions"]["rows"])
     assert rows.shape == (N_STEPS, DIM) and out["raw_actions"] == out["actions"] and out["latency_s"] >= 0
     batch = FakeModel.instances[-1].batches[-1]
     assert batch["images.cam_a"].shape == (1, 3, 8, 16) and batch["images.cam_a"].dtype == np.float32
     assert batch["images.cam_b"].shape == (1, 3, 16, 8)
-    assert batch["state"].shape == (1, DIM) and batch["task"] == ["open the box"]
+    assert batch["state"].shape == (1, DIM) and batch["task"] == ["close the box"]
 
 
 async def test_infer_defaults_task_to_viam_json(tmp_path):

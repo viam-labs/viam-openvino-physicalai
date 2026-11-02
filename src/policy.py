@@ -1,4 +1,4 @@
-"""viam-labs:openvino-physicalai:policy — OpenVINO or ONNX ACT inference over the viam-labs:vla policy protocol.
+"""viam-labs:openvino-physicalai:policy — OpenVINO or ONNX ACT and SmolVLA inference over the viam-labs:vla policy protocol.
 
 The vla controller (viam-labs/vla-inference-service) owns cameras, the arm, scheduling and
 safety; this service only answers its status/specs/infer/reset DoCommands.
@@ -29,6 +29,7 @@ LOGGER = getLogger(__name__)  # viam's logger: stdlib loggers never reach viam-s
 
 DEVICES = ("AUTO", "NPU", "GPU", "CPU")
 FORMATS = ("openvino", "onnx")
+POLICIES = ("act", "smolvla")
 
 
 class ConfigError(ValueError):
@@ -92,11 +93,18 @@ def read_package(path: Path | str, *, device: str) -> Package:
         raise LoadError(f"cannot read viam.json in {path}: {exc}") from exc
     if meta.get("schema_version") != 1:
         raise LoadError(f"unsupported viam.json schema_version {meta.get('schema_version')!r} (expected 1)")
-    if meta.get("policy") != "act":
-        raise LoadError(f"unsupported policy {meta.get('policy')!r} (only act)")
+    policy = meta.get("policy")
+    if policy not in POLICIES:
+        raise LoadError(f"unsupported policy {policy!r} (expected one of {POLICIES})")
     fmt = meta.get("format", "openvino")  # packages trained before ONNX support have no format
     if fmt not in FORMATS:
         raise LoadError(f"unsupported format {fmt!r} (expected one of {FORMATS})")
+    if policy == "smolvla":
+        # Training only writes openvino for SmolVLA; this guards a hand-edited package.
+        if fmt != "openvino":
+            raise LoadError(f"smolvla packages must be openvino, got format {fmt!r}")
+        if device == "NPU":
+            raise LoadError("SmolVLA does not compile for the NPU; use GPU")
     if fmt == "onnx":
         # The module's onnxruntime is the CPU build; physicalai would map GPU to CUDA and NPU to CPU silently.
         if device not in ("AUTO", "CPU"):
@@ -107,10 +115,10 @@ def read_package(path: Path | str, *, device: str) -> Package:
         state, action = meta["state"], meta["action"]
         keys = [key for key, _, _ in cameras]
         specs = {
-            "policy_type": "act",
+            "policy_type": policy,
             "action_dim": int(action["dim"]),
             "state_dim": int(state["dim"]),
-            # What predict_action_chunk returns: ACT's export trims the chunk to n_action_steps.
+            # What predict_action_chunk returns: the export trims the chunk to n_action_steps.
             "n_action_steps": int(meta["training"]["args"]["n_action_steps"]),
             "input_features": {**{key: shape for key, shape, _ in cameras}, state["input"]: [int(state["dim"])]},
             "output_features": {"action": [int(action["dim"])]},
@@ -118,7 +126,7 @@ def read_package(path: Path | str, *, device: str) -> Package:
             "declared_image_feature_keys": list(keys),
             # InferenceModel letterboxes to the graph input itself, as in training.
             "preprocess_image_size": None,
-            "num_steps": None,
+            "num_steps": meta["training"]["args"].get("num_steps"),  # SmolVLA's denoising steps; None for ACT
             "supports_rtc": False,
             "rtc_enabled": False,
             "relative_actions": False,
@@ -253,7 +261,7 @@ class PhysicalAIPolicy(Generic, EasyResource):
         model, package = self._model, self._package  # a reconfigure mid-request must not swap them
         specs = package.specs
         if command.get("rtc"):
-            raise WireError("RTC is not supported by ACT policies (specs.supports_rtc is false)")
+            raise WireError("RTC is not supported by this module (specs.supports_rtc is false)")
         started = time.perf_counter()
         images = {}
         for key, payload in _require_dict(command.get("images") or {}, "images").items():
@@ -277,5 +285,5 @@ class PhysicalAIPolicy(Generic, EasyResource):
         task = task or package.default_task  # the vla controller sends "" when no task is configured
         chunk = await asyncio.to_thread(model.predict_action_chunk, self._batch(package, images, state, task))
         actions = encode_matrix(np.asarray(chunk, np.float32))
-        # ACT has no separate policy space, so raw_actions repeats actions for protocol parity.
+        # No separate policy space is exposed, so raw_actions repeats actions for protocol parity.
         return {"actions": actions, "raw_actions": actions, "latency_s": time.perf_counter() - started}
