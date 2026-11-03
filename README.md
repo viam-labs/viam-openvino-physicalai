@@ -9,7 +9,7 @@ Trains an [Intel Physical AI Studio](https://github.com/open-edge-platform/physi
 ACT, SmolVLA or Pi0.5 policy from a Viam **sequence dataset**. The resulting Viam model version
 contains the OpenVINO export (`act.xml`, `act.bin`, `manifest.json`), or the ONNX export
 (`act.onnx`, `act.onnx.data`, `manifest.json`) with `export_format=onnx`, and
-`viam.json`, which says which cameras and arm feed the policy and how to apply
+`viam.json`, which says which cameras, arms and grippers feed the policy and how to apply
 its actions. A SmolVLA model version holds `smolvla.xml`, `smolvla.bin`, `tokenizer.xml`,
 `tokenizer.bin` and `manifest.json` in place of the ACT files, plus `viam.json`. A Pi0.5 model version holds
 `pi05.xml`, `pi05.bin` (about 6 GB), `tokenizer.xml`, `tokenizer.bin`, `manifest.json` and `viam.json`.
@@ -101,6 +101,8 @@ viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
   --model-name=<name> --model-version=1 --version=1 \
   --script-name=<org-id>:physical-ai-studio --container-id=<container-id> \
   --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",image_size=224
+# Two arms with grippers: quote each list.
+#   --args=arm="'left-arm right-arm'",grippers="'left-gripper right-gripper'",cameras="'overhead-cam wrist-cam'"
 viam train logs --job-id=<job-id>
 ```
 
@@ -144,7 +146,7 @@ DoCommands (`{"command": ...}`):
 | command | returns |
 |---|---|
 | `status` | `state` (`idle`, `loading`, `ready` or `failed`) and `error` |
-| `specs` | the vla specs fields, plus `cameras` (feature key to camera component), `arm` (the first arm) and `components` (each arm's and gripper's `offset`, `dim`, `method` and `apply` in the state and action vectors), taken from `viam.json` |
+| `specs` | the vla specs fields, plus `cameras` (feature key to camera component), `arm` (the first arm) and `components` (each arm's and gripper's `offset`, `dim`, `method`, `apply` and `units` in the state and action vectors, plus a gripper's `key`), taken from `viam.json` |
 | `infer` | `actions` and `raw_actions` (the same for ACT) from `images`, `state` and optional `task`, plus `latency_s` (decode and inference) |
 | `reset` | clears the model's internal state |
 
