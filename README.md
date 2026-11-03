@@ -84,7 +84,7 @@ viam train containers register --uri=docker.io/<user>/viam-openvino-physicalai:0
   --description="physicalai-train 0.3.0" --org-id=<org>
 ```
 
-`<commit>` is the viam-sequence-to-lerobot commit with `--action-arm`. The Docker Hub repo must be public. Never re-push a tag that's already registered;
+`<commit>` is the viam-sequence-to-lerobot commit with `--action-arm` and `--grippers`. The Docker Hub repo must be public. Never re-push a tag that's already registered;
 bump `<n>` instead.
 
 Building needs a Hugging Face token (from `hf auth login`) whose account has accepted the terms of
