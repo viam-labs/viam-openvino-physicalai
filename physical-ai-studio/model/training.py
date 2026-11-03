@@ -501,12 +501,26 @@ def package_version(name: str) -> str:
     return f"{dist.version}+{commit[:12]}" if commit else dist.version
 
 
+def manifest_components(args: argparse.Namespace, segments) -> list[dict]:
+    """viam.json's state/action layout: one entry per component, in vector order."""
+    components, offset = [], 0
+    for name, dim in segments:
+        if name in args.grippers:
+            how = {"method": "DoCommand", "key": args.gripper_key, "apply": "DoCommand", "units": "as captured"}
+        else:
+            how = {"method": "JointPositions", "apply": "MoveToJointPositions", "units": "degrees"}
+        components.append({"component": name, "offset": offset, "dim": dim, **how})
+        offset += dim
+    return components
+
+
 def write_manifest(
     args, out: Path, summary, policy, device: str, wall_time_s: float, versions: dict[str, str]
 ) -> dict:
     """Write viam.json: what the inference module needs beyond the export's manifest.json."""
     cameras, state = model_inputs(policy, args.cameras)
-    dim = state["shape"][0]  # the converter guarantees action dim == state dim in joints mode
+    dim = state["shape"][0]  # the converter's next-state and leader actions have the state's width
+    components = manifest_components(args, summary.segments)
     train_args = {
         "max_epochs": args.max_epochs, "batch_size": args.batch_size,
         # The trained policy's own values: VLA chunk sizes come from their checkpoint.
@@ -524,13 +538,15 @@ def write_manifest(
         "fps": args.fps,
         "cameras": cameras,
         "image_size": args.image_size,
-        "state": {**state, "component": args.arm[0], "method": "JointPositions", "units": "degrees", "dim": dim},
+        "state": {**state, "component": args.arm[0], "method": "JointPositions", "units": "degrees", "dim": dim,
+                  "components": [{k: v for k, v in c.items() if k != "apply"} for c in components]},
         "action": {
             "source": args.action_source,
             "apply": "MoveToJointPositions",
             "component": args.arm[0],  # always the follower: that's what gets commanded at inference
             "units": "degrees",
             "dim": dim,
+            "components": components,
         },
         "tasks": sorted(summary.tasks_written),
         "training": {

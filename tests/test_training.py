@@ -208,6 +208,8 @@ def test_trains_exports_and_runs_inference(tmp_path, layout, export_format):
     assert manifest["action"] == {
         "source": action_source, "apply": "MoveToJointPositions", "component": ARM,
         "units": "degrees", "dim": N_JOINTS,
+        "components": [{"component": ARM, "offset": 0, "dim": N_JOINTS, "method": "JointPositions",
+                        "apply": "MoveToJointPositions", "units": "degrees"}],
     }
     assert manifest["tasks"] == ["pick the cube"]
     assert manifest["training"]["args"]["chunk_size"] == 10
@@ -405,14 +407,47 @@ def test_manifest_records_pi05_training_args(tmp_path):
         inputs_schema=[feature("images", (3, 8, 8)), feature("state", (N_JOINTS,)), feature("task", ())],
         config=SimpleNamespace(chunk_size=50, n_action_steps=10),
     )
-    summary = SimpleNamespace(tasks_written={"open the box"}, episodes_written=1, frames_written=2, skipped=[])
+    summary = SimpleNamespace(tasks_written={"open the box"}, episodes_written=1, frames_written=2, skipped=[],
+                              segments=((ARM, N_JOINTS),))
     out = tmp_path / "out"
     out.mkdir()
     manifest = training.write_manifest(args, out, summary, policy, "cuda", 1.0, {})
+    assert manifest["action"]["components"] == [
+        {"component": ARM, "offset": 0, "dim": N_JOINTS, "method": "JointPositions",
+         "apply": "MoveToJointPositions", "units": "degrees"}]
     train_args = manifest["training"]["args"]
     assert manifest["policy"] == "pi05"
     assert (train_args["pretrained"], train_args["num_steps"], train_args["lora_rank"]) == ("lerobot/pi05_base", 10, 8)
     assert (train_args["chunk_size"], train_args["n_action_steps"]) == (50, 10)
+
+
+def test_manifest_components_bimanual(tmp_path):
+    files = [f"--{arg}=x" for arg in ARG_FOR_FILE] + [f"--model_output_directory={tmp_path}", f"--cameras={CAM}"]
+    args = parse_args(files + ["--arm=left-arm right-arm", "--grippers=left-gripper right-gripper"])
+    dim = 2 * (N_JOINTS + 1)
+    feature = lambda name, shape: SimpleNamespace(name=name, shape=shape)  # noqa: E731
+    policy = SimpleNamespace(
+        inputs_schema=[feature("images", (3, 8, 8)), feature("state", (dim,))],
+        config=SimpleNamespace(chunk_size=10, n_action_steps=5),
+    )
+    segments = (("left-arm", N_JOINTS), ("left-gripper", 1), ("right-arm", N_JOINTS), ("right-gripper", 1))
+    summary = SimpleNamespace(tasks_written={"t"}, episodes_written=1, frames_written=2, skipped=[], segments=segments)
+    out = tmp_path / "out"
+    out.mkdir()
+    manifest = training.write_manifest(args, out, summary, policy, "cpu", 1.0, {})
+
+    arm = {"method": "JointPositions", "apply": "MoveToJointPositions", "units": "degrees"}
+    grip = {"method": "DoCommand", "key": "position", "apply": "DoCommand", "units": "as captured"}
+    assert manifest["action"]["components"] == [
+        {"component": "left-arm", "offset": 0, "dim": N_JOINTS, **arm},
+        {"component": "left-gripper", "offset": N_JOINTS, "dim": 1, **grip},
+        {"component": "right-arm", "offset": N_JOINTS + 1, "dim": N_JOINTS, **arm},
+        {"component": "right-gripper", "offset": 2 * N_JOINTS + 1, "dim": 1, **grip},
+    ]
+    assert all("apply" not in c for c in manifest["state"]["components"])
+    assert [c["component"] for c in manifest["state"]["components"]] == [name for name, _ in segments]
+    assert manifest["action"]["component"] == manifest["state"]["component"] == "left-arm"
+    assert manifest["action"]["dim"] == manifest["state"]["dim"] == dim
 
 
 def test_progress_callback_logs_speed_wait_and_loss(caplog):
