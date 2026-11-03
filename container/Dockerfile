@@ -5,7 +5,7 @@
 FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 
 ARG PHYSICALAI_VERSION=0.3.0
-# Commit of viam-labs/viam-sequence-to-lerobot that includes --action-arm.
+# Commit of viam-labs/viam-sequence-to-lerobot with --action-arm and --grippers.
 ARG CONVERTER_REF
 
 # torchcodec's cu128 build dlopens libpython3.12 and NPP (libnppicc.so.12), which torch doesn't ship.

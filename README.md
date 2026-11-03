@@ -19,10 +19,11 @@ its actions. A SmolVLA model version holds `smolvla.xml`, `smolvla.bin`, `tokeni
 Configure the [capture control sensor](https://docs.viam.com/data/capture-sync/capture-on-demand/)
 with:
 - each camera on `GetImages`;
-- the follower arm on `JointPositions`;
+- each follower arm on `JointPositions`;
+- each gripper on `DoCommand`, with a fixed `docommand_input` whose response holds its position as a number (under `position` unless you set `gripper_key`);
 - optionally, a teleop leader arm on `JointPositions`.
 
-Use the same frequency for all of them, e.g. 10 Hz. Call
+Use the same frequency for all of them, e.g. 10 Hz. Every frame needs a reading from every component within 50 ms, so more components drop more frames when captures drift. Call
 `start_capture` with `{"tags": ["cmd:<instruction>"]}` at the start of each
 demonstration and `stop_capture` at the end. Each pair becomes one sequence, and
 each sequence becomes one training episode. Add the sequences to a sequence dataset.
@@ -35,9 +36,11 @@ blends every task into one behavior (the training job warns when that happens).
 
 | arg | default | meaning |
 |---|---|---|
-| `arm` | required | follower arm component |
+| `arm` | required | space-separated follower arm components; with several, state and action are `[arm1 joints, gripper1, arm2 joints, gripper2]` |
+| `grippers` | unset | space-separated grippers captured with `DoCommand`, one per arm in the same order |
+| `gripper_key` | `position` | numeric field of each gripper's `DoCommand` response |
 | `cameras` | required | space-separated camera components; the first is the frame clock |
-| `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`) |
+| `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`); leader arms are single-arm only, without grippers |
 | `policy` | `act` | or `smolvla`, a vision-language-action model conditioned on the task text, or `pi05`, Physical Intelligence's Pi0.5 (~3.6B parameters, LoRA fine-tuned) |
 | `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only; smolvla and pi05 are `openvino` only |
 | `pretrained` | `lerobot/smolvla_base` / `lerobot/pi05_base` | smolvla/pi05: checkpoint to fine-tune (Hugging Face id or directory). The job downloads it (about 1 GB for `smolvla_base`, 15 GB for `pi05_base`), so it needs Hugging Face access |
@@ -141,7 +144,7 @@ DoCommands (`{"command": ...}`):
 | command | returns |
 |---|---|
 | `status` | `state` (`idle`, `loading`, `ready` or `failed`) and `error` |
-| `specs` | the vla specs fields, plus `cameras` (feature key to camera component) and `arm` taken from `viam.json` |
+| `specs` | the vla specs fields, plus `cameras` (feature key to camera component), `arm` (the first arm) and `components` (each arm's and gripper's `offset`, `dim`, `method` and `apply` in the state and action vectors), taken from `viam.json` |
 | `infer` | `actions` and `raw_actions` (the same for ACT) from `images`, `state` and optional `task`, plus `latency_s` (decode and inference) |
 | `reset` | clears the model's internal state |
 
@@ -164,6 +167,8 @@ For a SmolVLA or Pi0.5 model, pass the instruction per run: `{"command": "start"
 overrides the configured `task`. The package's `viam.json` lists the trained `tasks`.
 
 `state_joint_indices` is `[0 .. state_dim-1]`. Units are degrees, the controller's default.
+
+`viam-labs:vla:controller` drives one arm today; models with several arms or grippers (`specs.components` longer than one) need its bimanual support, which is planned separately.
 
 ### Latency
 
