@@ -7,6 +7,7 @@ import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -103,12 +104,18 @@ def required_argv(tmp_path: Path) -> list[str]:
     "bad, msg",
     [
         ({"max_epoch": 1}, "--max_epoch"),
-        ({"policy": "pi05"}, "invalid choice: 'pi05'"),
+        ({"policy": "diffusion"}, "invalid choice: 'diffusion'"),
         ({"export_format": "torch"}, "invalid choice: 'torch'"),
         ({"policy": "smolvla", "chunk_size": 20}, "--chunk_size is fixed"),
         ({"policy": "smolvla", "export_format": "onnx"}, "openvino only"),
         ({"policy": "smolvla", "n_action_steps": 0}, "--n_action_steps must be at least 1"),
         ({"policy": "smolvla", "num_steps": 0}, "--num_steps must be at least 1"),
+        ({"policy": "pi05", "chunk_size": 20}, "--chunk_size is fixed"),
+        ({"policy": "pi05", "export_format": "onnx"}, "openvino only"),
+        ({"policy": "pi05", "num_steps": 0}, "--num_steps must be at least 1"),
+        ({"policy": "pi05", "lora_rank": -1}, "--lora_rank must be 0"),
+        ({"lora_rank": 8}, "--lora_rank applies to pi05 only"),
+        ({"policy": "smolvla", "lora_rank": 8}, "--lora_rank applies to pi05 only"),
         ({"chunk_size": 5, "n_action_steps": 10}, "--n_action_steps"),
         ({"action_source": ARM}, "--action_source"),
     ],
@@ -130,10 +137,16 @@ def test_export_format_defaults_to_openvino(tmp_path):
 def test_chunk_defaults_per_policy(tmp_path):
     act = parse_args(required_argv(tmp_path))
     assert (act.chunk_size, act.n_action_steps) == (100, 100)
+    assert (act.pretrained, act.lora_rank) == (None, None)
     smol = parse_args([*required_argv(tmp_path), "--policy=smolvla"])
-    # SmolVLA's chunk size comes from its checkpoint, resolved in build_policy().
+    # VLA chunk sizes come from the checkpoint, resolved in build_policy().
     assert (smol.chunk_size, smol.n_action_steps) == (None, None)
-    assert (smol.pretrained, smol.num_steps) == ("lerobot/smolvla_base", 10)
+    assert (smol.pretrained, smol.num_steps, smol.lora_rank) == ("lerobot/smolvla_base", 10, None)
+    pi = parse_args([*required_argv(tmp_path), "--policy=pi05"])
+    assert (pi.chunk_size, pi.n_action_steps) == (None, None)
+    assert (pi.pretrained, pi.num_steps, pi.lora_rank) == ("lerobot/pi05_base", 10, 32)
+    full = parse_args([*required_argv(tmp_path), "--policy=pi05", "--lora_rank=0", "--pretrained=me/pi05"])
+    assert (full.pretrained, full.lora_rank) == ("me/pi05", 0)
 
 
 def test_misspelled_camera_lists_present_components(tmp_path):
@@ -237,6 +250,35 @@ def test_smolvla_trains_exports_and_runs_inference(tmp_path):
     assert np.asarray(model.predict_action_chunk(batch)).shape == (10, N_JOINTS)
 
 
+@pytest.mark.skipif(
+    not os.environ.get("PHYSICALAI_TEST_PI05"),
+    reason="set PHYSICALAI_TEST_PI05=1: downloads lerobot/pi05_base (~15 GB), needs the image's cached "
+           "PaliGemma tokenizer and a large GPU or ~60 GB of RAM",
+)
+def test_pi05_trains_exports_and_runs_inference(tmp_path):
+    from physicalai.inference import InferenceModel
+
+    export = build_export(tmp_path, [CAM, WRIST])
+    out = tmp_path / "out"
+    run(local_files(export), out, arm=ARM, cameras=f"{CAM} {WRIST}", policy="pi05",
+        max_epochs=1, batch_size=2, vcodec="libsvtav1", n_action_steps=10)
+
+    assert (out / "pi05.xml").is_file() and (out / "tokenizer.xml").is_file()
+    manifest = json.loads((out / "viam.json").read_text())
+    assert (manifest["policy"], manifest["format"]) == ("pi05", "openvino")
+    assert [c["input"] for c in manifest["cameras"]] == ["images.overhead_cam", "images.wrist_cam"]
+    train_args = manifest["training"]["args"]
+    assert (train_args["chunk_size"], train_args["n_action_steps"], train_args["lora_rank"]) == (50, 10, 32)
+    assert (train_args["pretrained"], train_args["num_steps"]) == ("lerobot/pi05_base", 10)
+    assert manifest["tasks"] == ["pick the cube"]
+
+    model = InferenceModel(out)
+    batch = {cam["input"]: np.zeros((1, *cam["shape"]), np.float32) for cam in manifest["cameras"]}
+    batch[manifest["state"]["input"]] = np.zeros((1, *manifest["state"]["shape"]), np.float32)
+    batch["task"] = ["pick the cube"]
+    assert np.asarray(model.predict_action_chunk(batch)).shape == (10, N_JOINTS)
+
+
 def test_check_checkpoint_rejects_oversized_n_action_steps(tmp_path):
     ckpt = tmp_path / "ckpt"
     ckpt.mkdir()
@@ -314,3 +356,56 @@ def test_act_warns_when_tasks_differ(tmp_path, monkeypatch, caplog, tasks, warns
     with caplog.at_level("WARNING", logger="physical-ai-studio"), pytest.raises(SystemExit, match="stopped"):
         run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, vcodec="libsvtav1")
     assert ("ACT ignores task text" in caplog.text) == warns
+
+
+def _checkpoint(tmp_path: Path, **config) -> Path:
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(json.dumps(config))
+    return ckpt
+
+
+def test_check_checkpoint_rejects_another_policys_checkpoint(tmp_path):
+    ckpt = _checkpoint(tmp_path, type="smolvla", chunk_size=50)
+    args = parse_args([*required_argv(tmp_path), "--policy=pi05", f"--pretrained={ckpt}"])
+    with pytest.raises(SystemExit, match="is a smolvla checkpoint, not pi05"):
+        training.check_checkpoint(args)
+
+
+class FakePi05:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.mark.parametrize("extra, lora, steps", [
+    ([], {"lora_enabled": True, "lora_rank": 32}, 50),
+    (["--lora_rank=0", "--n_action_steps=10"], {}, 10),
+])
+def test_build_policy_pi05(tmp_path, monkeypatch, extra, lora, steps):
+    import physicalai.policies
+
+    monkeypatch.setattr(physicalai.policies, "Pi05", FakePi05)
+    ckpt = _checkpoint(tmp_path, type="pi05", chunk_size=50)
+    args = parse_args([*required_argv(tmp_path), "--policy=pi05", f"--pretrained={ckpt}", "--num_steps=5", *extra])
+    policy = training.build_policy(args)
+    # n_action_steps is always passed: Pi05's own default (50) would override the checkpoint's.
+    assert policy.kwargs == {
+        "pretrained_name_or_path": str(ckpt), "num_inference_steps": 5, "n_action_steps": steps, **lora,
+    }
+
+
+def test_manifest_records_pi05_training_args(tmp_path):
+    args = parse_args([*required_argv(tmp_path), "--policy=pi05", "--lora_rank=8"])
+    feature = lambda name, shape: SimpleNamespace(name=name, shape=shape)  # noqa: E731
+    policy = SimpleNamespace(
+        inputs_schema=[feature("images", (3, 8, 8)), feature("state", (N_JOINTS,)), feature("task", ())],
+        config=SimpleNamespace(chunk_size=50, n_action_steps=10),
+    )
+    summary = SimpleNamespace(tasks_written={"open the box"}, episodes_written=1, frames_written=2, skipped=[])
+    out = tmp_path / "out"
+    out.mkdir()
+    manifest = training.write_manifest(args, out, summary, policy, "cuda", 1.0, {})
+    train_args = manifest["training"]["args"]
+    assert manifest["policy"] == "pi05"
+    assert (train_args["pretrained"], train_args["num_steps"], train_args["lora_rank"]) == ("lerobot/pi05_base", 10, 8)
+    assert (train_args["chunk_size"], train_args["n_action_steps"]) == (50, 10)

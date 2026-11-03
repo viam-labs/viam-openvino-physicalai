@@ -71,25 +71,28 @@ def test_read_package_builds_vla_specs(tmp_path):
 
 @pytest.mark.parametrize(
     "overrides, msg",
-    [({"schema_version": 2}, "schema_version"), ({"policy": "pi05"}, "policy"), ({"format": "torch"}, "format"), ({"cameras": "x"}, "invalid")],
+    [({"schema_version": 2}, "schema_version"), ({"policy": "diffusion"}, "policy"), ({"format": "torch"}, "format"), ({"cameras": "x"}, "invalid")],
 )
 def test_unsupported_package_raises(tmp_path, overrides, msg):
     with pytest.raises(LoadError, match=msg):
         read_package(write_package(tmp_path / "m", **overrides), device="CPU")
 
 
-SMOLVLA_TRAINING = {"args": {"chunk_size": 50, "n_action_steps": N_STEPS, "num_steps": 10}}
+VLA_TRAINING = {"args": {"chunk_size": 50, "n_action_steps": N_STEPS, "num_steps": 10}}
 
 
-def test_read_package_smolvla(tmp_path):
-    pkg = read_package(write_package(tmp_path / "m", policy="smolvla", training=SMOLVLA_TRAINING), device="GPU")
+@pytest.mark.parametrize("policy", ["smolvla", "pi05"])
+@pytest.mark.parametrize("device", ["AUTO", "GPU", "CPU"])
+def test_read_package_vla(tmp_path, policy, device):
+    pkg = read_package(write_package(tmp_path / "m", policy=policy, training=VLA_TRAINING), device=device)
     s = pkg.specs
-    assert (s["policy_type"], s["num_steps"], s["n_action_steps"], s["device"]) == ("smolvla", 10, N_STEPS, "GPU")
+    assert (s["policy_type"], s["num_steps"], s["n_action_steps"], s["device"]) == (policy, 10, N_STEPS, device)
 
 
+@pytest.mark.parametrize("policy", ["smolvla", "pi05"])
 @pytest.mark.parametrize("overrides, device, msg", [({}, "NPU", "NPU"), ({"format": "onnx"}, "CPU", "openvino")])
-def test_smolvla_package_rejects(tmp_path, overrides, device, msg):
-    path = write_package(tmp_path / "m", policy="smolvla", training=SMOLVLA_TRAINING, **overrides)
+def test_vla_package_rejects(tmp_path, policy, overrides, device, msg):
+    path = write_package(tmp_path / "m", policy=policy, training=VLA_TRAINING, **overrides)
     with pytest.raises(LoadError, match=msg):
         read_package(path, device=device)
 

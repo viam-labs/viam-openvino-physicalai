@@ -6,12 +6,13 @@ Two parts: a Viam custom training script (`physical-ai-studio/`) and a Viam modu
 ## physical-ai-studio: Viam custom training script
 
 Trains an [Intel Physical AI Studio](https://github.com/open-edge-platform/physical-ai-studio)
-ACT or SmolVLA policy from a Viam **sequence dataset**. The resulting Viam model version
+ACT, SmolVLA or Pi0.5 policy from a Viam **sequence dataset**. The resulting Viam model version
 contains the OpenVINO export (`act.xml`, `act.bin`, `manifest.json`), or the ONNX export
 (`act.onnx`, `act.onnx.data`, `manifest.json`) with `export_format=onnx`, and
 `viam.json`, which says which cameras and arm feed the policy and how to apply
 its actions. A SmolVLA model version holds `smolvla.xml`, `smolvla.bin`, `tokenizer.xml`,
-`tokenizer.bin` and `manifest.json` in place of the ACT files, plus `viam.json`.
+`tokenizer.bin` and `manifest.json` in place of the ACT files, plus `viam.json`. A Pi0.5 model version holds
+`pi05.xml`, `pi05.bin` (about 6 GB), `tokenizer.xml`, `tokenizer.bin`, `manifest.json` and `viam.json`.
 
 ## 1. Record demonstrations
 
@@ -26,8 +27,8 @@ Use the same frequency for all of them, e.g. 10 Hz. Call
 demonstration and `stop_capture` at the end. Each pair becomes one sequence, and
 each sequence becomes one training episode. Add the sequences to a sequence dataset.
 
-Give each task its own instruction, e.g. `cmd:open the box` and `cmd:close the box`. SmolVLA
-learns one policy that follows whichever instruction it is given; ACT ignores the text and
+Give each task its own instruction, e.g. `cmd:open the box` and `cmd:close the box`. SmolVLA and Pi0.5
+learn one policy that follows whichever instruction it is given; ACT ignores the text and
 blends every task into one behavior (the training job warns when that happens).
 
 ## 2. Custom arguments
@@ -37,10 +38,11 @@ blends every task into one behavior (the training job warns when that happens).
 | `arm` | required | follower arm component |
 | `cameras` | required | space-separated camera components; the first is the frame clock |
 | `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`) |
-| `policy` | `act` | or `smolvla`, a vision-language-action model conditioned on the task text |
-| `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only; smolvla is `openvino` only |
-| `pretrained` | `lerobot/smolvla_base` | smolvla only: checkpoint to fine-tune (Hugging Face id or directory). The job downloads it (about 1 GB for `smolvla_base`), so it needs Hugging Face access |
-| `num_steps` | `10` | smolvla only: denoising steps per inference |
+| `policy` | `act` | or `smolvla`, a vision-language-action model conditioned on the task text, or `pi05`, Physical Intelligence's Pi0.5 (~3.6B parameters, LoRA fine-tuned) |
+| `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only; smolvla and pi05 are `openvino` only |
+| `pretrained` | `lerobot/smolvla_base` / `lerobot/pi05_base` | smolvla/pi05: checkpoint to fine-tune (Hugging Face id or directory). The job downloads it (about 1 GB for `smolvla_base`, 15 GB for `pi05_base`), so it needs Hugging Face access |
+| `num_steps` | `10` | smolvla/pi05: denoising steps per inference |
+| `lora_rank` | `32` | pi05 only: LoRA adapter rank; 0 fine-tunes every weight, which does not fit a 40 GB GPU |
 | `fps` | `10` | must match the capture `frequency_hz` |
 | `image_size` | unset | downscale the longest image side; also ACT's input size. `224` makes jobs much faster |
 | `vcodec` | `auto` | `auto` uses the first of `h264_nvenc`, `h264`, `libsvtav1` that can encode on the machine |
@@ -48,7 +50,7 @@ blends every task into one behavior (the training job warns when that happens).
 | `task` | unset | instruction for sequences without a `cmd:` tag |
 | `max_epochs` | `100` | |
 | `batch_size` | `8` | |
-| `chunk_size` | `100` | act only: actions predicted per inference; 100 is about 10 s at 10 fps. smolvla's is fixed by `pretrained` (50 for `smolvla_base`) |
+| `chunk_size` | `100` | act only: actions predicted per inference; 100 is about 10 s at 10 fps. smolvla's and pi05's are fixed by `pretrained` (50) |
 | `n_action_steps` | the chunk size | actions executed before predicting again (≤ the chunk size); lower means the policy replans more often |
 
 ## 3. Run locally
@@ -65,7 +67,7 @@ docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work \
 
 `viam training-script test-local` does not support sequence datasets.
 
-Build a local `<image>` with `docker buildx build --platform linux/amd64 -f container/Dockerfile --build-arg CONVERTER_REF=<commit> -t viam-openvino-physicalai:dev --load .`
+Build a local `<image>` with `docker buildx build --platform linux/amd64 -f container/Dockerfile --build-arg CONVERTER_REF=<commit> --secret id=hf_token,src=$HOME/.cache/huggingface/token -t viam-openvino-physicalai:dev --load .`
 
 Tests: `docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w /work -e PYTHONPATH=/work/physical-ai-studio <image> python3 -m pytest tests/test_training.py -q`
 
@@ -73,6 +75,7 @@ Tests: `docker run --rm --platform linux/amd64 --shm-size=2g -v "$PWD":/work -w 
 
 ```sh
 docker buildx build --platform linux/amd64 -f container/Dockerfile --build-arg CONVERTER_REF=<commit> \
+  --secret id=hf_token,src=$HOME/.cache/huggingface/token \
   -t docker.io/<user>/viam-openvino-physicalai:0.3.0-<n> --push .
 viam train containers register --uri=docker.io/<user>/viam-openvino-physicalai:0.3.0-<n> \
   --description="physicalai-train 0.3.0" --org-id=<org>
@@ -80,6 +83,10 @@ viam train containers register --uri=docker.io/<user>/viam-openvino-physicalai:0
 
 `<commit>` is the viam-sequence-to-lerobot commit with `--action-arm`. The Docker Hub repo must be public. Never re-push a tag that's already registered;
 bump `<n>` instead.
+
+Building needs a Hugging Face token (from `hf auth login`) whose account has accepted the terms of
+`google/paligemma-3b-pt-224`; the image redistributes that tokenizer under the Gemma Terms of Use,
+included at `/opt/licenses/GEMMA_TERMS.txt`.
 
 ## 5. Upload and train
 
@@ -109,7 +116,7 @@ the cameras, the arm, scheduling and safety.
 | attribute | default | meaning |
 |---|---|---|
 | `model_path` | required | directory holding `viam.json` and the OpenVINO or ONNX export |
-| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU`; ONNX exports accept only `AUTO` or `CPU`; for SmolVLA use `GPU` (`CPU` works but takes about 2 s per chunk; `NPU` is rejected because SmolVLA does not compile there) |
+| `device` | `AUTO` | `AUTO`, `NPU`, `GPU` or `CPU`; ONNX exports accept only `AUTO` or `CPU`; for SmolVLA and Pi0.5 use `GPU` (`CPU` works but takes about 2 s per chunk for SmolVLA and 11 s for Pi0.5; `NPU` is rejected because neither compiles there) |
 | `warmup_inferences` | `2` | throwaway inferences after loading |
 | `load_timeout_s` | `600` | give up loading after this long |
 
@@ -153,7 +160,7 @@ Map each key in the policy's `specs.cameras` to its camera component. For the bo
 }
 ```
 
-For a SmolVLA model, pass the instruction per run: `{"command": "start", "task": "close the box"}`
+For a SmolVLA or Pi0.5 model, pass the instruction per run: `{"command": "start", "task": "close the box"}`
 overrides the configured `task`. The package's `viam.json` lists the trained `tasks`.
 
 `state_joint_indices` is `[0 .. state_dim-1]`. Units are degrees, the controller's default.
@@ -174,6 +181,9 @@ SmolVLA (`lerobot/smolvla_base`, not fine-tuned, three 256x256 cameras, 10 denoi
 inputs) on the same NUC, median `predict_action_chunk` over 10 calls: GPU 89 ms, CPU 1.9 s. It does
 not compile for the NPU.
 
+Pi0.5 (`lerobot/pi05_base`, not fine-tuned, three 224x224 cameras, 10 denoising steps): GPU 230 ms per
+chunk, CPU 10.9 s; it does not compile for the NPU.
+
 ### Development
 
 ```sh
@@ -181,6 +191,9 @@ uv venv .venv --python 3.12 && VIRTUAL_ENV=.venv uv pip install -r requirements-
 .venv/bin/python -m pytest tests/test_wire.py tests/test_policy.py tests/test_build.py -q
 ```
 
-Set `PHYSICALAI_TEST_MODEL` to a model package directory to run the integration test. Try the module on a
+Set `PHYSICALAI_TEST_MODEL` to a model package directory to run the integration test. In the training
+image, `PHYSICALAI_TEST_SMOLVLA=1` and `PHYSICALAI_TEST_PI05=1` turn on the SmolVLA and Pi0.5 train, export
+and infer tests: they download `smolvla_base` (about 1 GB) or `pi05_base` (about 15 GB), and Pi0.5 needs a
+large GPU or about 60 GB of RAM. Try the module on a
 machine with `viam module reload --part-id <part-id>`. To publish, create a GitHub release; the workflow in
 `.github/workflows/deploy.yml` builds it in Viam's cloud build.

@@ -1,4 +1,4 @@
-"""viam-labs:openvino-physicalai:policy — OpenVINO or ONNX ACT and SmolVLA inference over the viam-labs:vla policy protocol.
+"""viam-labs:openvino-physicalai:policy — OpenVINO or ONNX ACT, SmolVLA and Pi0.5 inference over the viam-labs:vla policy protocol.
 
 The vla controller (viam-labs/vla-inference-service) owns cameras, the arm, scheduling and
 safety; this service only answers its status/specs/infer/reset DoCommands.
@@ -29,7 +29,9 @@ LOGGER = getLogger(__name__)  # viam's logger: stdlib loggers never reach viam-s
 
 DEVICES = ("AUTO", "NPU", "GPU", "CPU")
 FORMATS = ("openvino", "onnx")
-POLICIES = ("act", "smolvla")
+POLICIES = ("act", "smolvla", "pi05")
+# Vision-language-action policies: OpenVINO only, and their graphs do not compile for the NPU.
+VLA_NAMES = {"smolvla": "SmolVLA", "pi05": "Pi0.5"}
 
 
 class ConfigError(ValueError):
@@ -99,12 +101,12 @@ def read_package(path: Path | str, *, device: str) -> Package:
     fmt = meta.get("format", "openvino")  # packages trained before ONNX support have no format
     if fmt not in FORMATS:
         raise LoadError(f"unsupported format {fmt!r} (expected one of {FORMATS})")
-    if policy == "smolvla":
-        # Training only writes openvino for SmolVLA; this guards a hand-edited package.
+    if policy in VLA_NAMES:
+        # Training only writes openvino for VLAs; this guards a hand-edited package.
         if fmt != "openvino":
-            raise LoadError(f"smolvla packages must be openvino, got format {fmt!r}")
+            raise LoadError(f"{policy} packages must be openvino, got format {fmt!r}")
         if device == "NPU":
-            raise LoadError("SmolVLA does not compile for the NPU; use GPU")
+            raise LoadError(f"{VLA_NAMES[policy]} does not compile for the NPU; use GPU")
     if fmt == "onnx":
         # The module's onnxruntime is the CPU build; physicalai would map GPU to CUDA and NPU to CPU silently.
         if device not in ("AUTO", "CPU"):
@@ -126,7 +128,7 @@ def read_package(path: Path | str, *, device: str) -> Package:
             "declared_image_feature_keys": list(keys),
             # InferenceModel letterboxes to the graph input itself, as in training.
             "preprocess_image_size": None,
-            "num_steps": meta["training"]["args"].get("num_steps"),  # SmolVLA's denoising steps; None for ACT
+            "num_steps": meta["training"]["args"].get("num_steps"),  # VLA denoising steps; None for ACT
             "supports_rtc": False,
             "rtc_enabled": False,
             "relative_actions": False,

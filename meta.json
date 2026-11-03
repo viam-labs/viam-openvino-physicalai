@@ -3,12 +3,12 @@
   "module_id": "viam-labs:openvino-physicalai",
   "visibility": "public",
   "url": "https://github.com/viam-labs/viam-openvino-physicalai",
-  "description": "Serve OpenVINO or ONNX ACT and OpenVINO SmolVLA policies trained with Intel's physicalai over the viam-labs:vla policy protocol.",
+  "description": "Serve OpenVINO ACT, SmolVLA and Pi0.5, or ONNX ACT, policies trained with Intel's physicalai over the viam-labs:vla policy protocol.",
   "models": [
     {
       "api": "rdk:service:generic",
       "model": "viam-labs:openvino-physicalai:policy",
-      "short_description": "OpenVINO ACT and SmolVLA or ONNX (CPU) ACT inference over the viam-labs:vla:policy protocol",
+      "short_description": "OpenVINO ACT, SmolVLA and Pi0.5 or ONNX (CPU) ACT over the viam-labs:vla:policy protocol",
       "markdown_link": "README.md#policy-module"
     }
   ],

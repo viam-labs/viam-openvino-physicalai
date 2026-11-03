@@ -1,4 +1,4 @@
-"""Viam custom training script: Viam sequence dataset -> LeRobot -> physicalai ACT -> OpenVINO or ONNX.
+"""Viam custom training script: Viam sequence dataset -> LeRobot -> physicalai ACT, SmolVLA or Pi0.5 -> OpenVINO or ONNX.
 
 Viam runs `python3 -m model.training` with the sequence-dataset file arguments
 plus custom `--key=value` arguments. Everything except tmp/ in
@@ -29,9 +29,14 @@ logger = logging.getLogger("physical-ai-studio")
 # LeRobot dataset name; the converter and the datamodule must agree on it.
 DATASET_REPO_ID = "viam/dataset"
 
-POLICIES = ("act", "smolvla")
-# ACT's library default; at 10 fps, 100 steps is ~10 s of open-loop actions. SmolVLA's chunk
-# size is fixed by its --pretrained checkpoint (50 for lerobot/smolvla_base).
+POLICIES = ("act", "smolvla", "pi05")
+# Vision-language-action policies: fine-tuned from a checkpoint that fixes their chunk size
+# (50 for both bases), conditioned on task text, exported to OpenVINO only.
+VLAS = ("smolvla", "pi05")
+PRETRAINED = {"smolvla": "lerobot/smolvla_base", "pi05": "lerobot/pi05_base"}
+# Pi0.5 is ~3.6B parameters: a full fine-tune with Adam does not fit one 40 GB A100, LoRA does.
+LORA_RANK = 32
+# ACT's library default; at 10 fps, 100 steps is ~10 s of open-loop actions.
 ACT_CHUNK_SIZE = 100
 # physicalai ExportBackend values offered here; ACT supports both.
 EXPORT_FORMATS = ("openvino", "onnx")
@@ -73,11 +78,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy", choices=POLICIES, default="act")
     parser.add_argument("--export_format", choices=EXPORT_FORMATS, default="openvino")
     parser.add_argument(
-        "--pretrained", default="lerobot/smolvla_base",
-        help="smolvla only: checkpoint to fine-tune (Hugging Face id or local directory)",
+        "--pretrained", default=None,
+        help="smolvla/pi05: checkpoint to fine-tune (Hugging Face id or local directory; "
+             "default " + ", ".join(f"{p}: {c}" for p, c in PRETRAINED.items()) + ")",
     )
     parser.add_argument(
-        "--num_steps", type=int, default=10, help="smolvla only: flow-matching denoising steps per inference"
+        "--num_steps", type=int, default=10, help="smolvla/pi05: flow-matching denoising steps per inference"
+    )
+    parser.add_argument(
+        "--lora_rank", type=int, default=None,
+        help=f"pi05 only: LoRA adapter rank (default {LORA_RANK}); 0 fine-tunes every weight",
     )
     parser.add_argument("--fps", type=int, default=10, help="must match the capture frequency_hz")
     parser.add_argument("--image_size", type=int, default=None, help="downscale longest image side")
@@ -104,16 +114,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--cameras must name at least one camera component")
     if args.action_source == args.arm:
         parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
-    if args.policy == "smolvla":
+    if args.lora_rank is not None and args.policy != "pi05":
+        parser.error("--lora_rank applies to pi05 only")
+    if args.policy in VLAS:
         if args.chunk_size is not None:
-            parser.error("--chunk_size is fixed by the --pretrained checkpoint for smolvla; set --n_action_steps instead")
+            parser.error(
+                f"--chunk_size is fixed by the --pretrained checkpoint for {args.policy}; set --n_action_steps instead"
+            )
         if args.export_format != "openvino":
-            parser.error("smolvla exports to openvino only")
+            parser.error(f"{args.policy} exports to openvino only")
         if args.num_steps < 1:
             parser.error("--num_steps must be at least 1")
         # The upper bound is the checkpoint's chunk size, checked in check_checkpoint().
         if args.n_action_steps is not None and args.n_action_steps < 1:
             parser.error("--n_action_steps must be at least 1")
+        if args.pretrained is None:
+            args.pretrained = PRETRAINED[args.policy]
+        if args.policy == "pi05":
+            if args.lora_rank is None:
+                args.lora_rank = LORA_RANK
+            if args.lora_rank < 0:
+                parser.error("--lora_rank must be 0 (full fine-tune) or more")
     else:
         if args.chunk_size is None:
             args.chunk_size = ACT_CHUNK_SIZE
@@ -272,7 +293,7 @@ def feature_key(camera: str) -> str:
 
 
 def checkpoint_config(pretrained: str) -> dict:
-    """A SmolVLA checkpoint's parsed config.json, from a local directory or the Hub."""
+    """A SmolVLA or Pi0.5 checkpoint's parsed config.json, from a local directory or the Hub."""
     try:
         local = Path(pretrained)
         if local.is_dir():
@@ -287,10 +308,14 @@ def checkpoint_config(pretrained: str) -> dict:
 
 
 def check_checkpoint(args: argparse.Namespace) -> None:
-    """Fail before the slow dataset conversion if the SmolVLA checkpoint or --n_action_steps is unusable."""
-    chunk = checkpoint_config(args.pretrained).get("chunk_size")
+    """Fail before the slow dataset conversion if the VLA checkpoint or --n_action_steps is unusable."""
+    config = checkpoint_config(args.pretrained)
+    kind = config.get("type")
+    if kind is not None and kind != args.policy:
+        raise SystemExit(f"--pretrained={args.pretrained} is a {kind} checkpoint, not {args.policy}")
+    chunk = config.get("chunk_size")
     if not isinstance(chunk, int):
-        raise SystemExit(f"--pretrained={args.pretrained} config.json has no integer chunk_size: not a SmolVLA checkpoint?")
+        raise SystemExit(f"--pretrained={args.pretrained} config.json has no integer chunk_size: not a {args.policy} checkpoint?")
     if args.n_action_steps is not None and args.n_action_steps > chunk:
         raise SystemExit(f"--n_action_steps={args.n_action_steps} exceeds the {args.pretrained} chunk size ({chunk})")
 
@@ -303,6 +328,22 @@ def build_policy(args: argparse.Namespace):
         # ACT letterboxes frames to image_size; its default (384) would pad 224px frames back up.
         size = {"image_size": (args.image_size, args.image_size)} if args.image_size else {}
         return ACT(chunk_size=args.chunk_size, n_action_steps=args.n_action_steps, **size)
+
+    if args.policy == "pi05":
+        from physicalai.policies import Pi05
+
+        # Pi05 takes no camera arguments: fine-tuning swaps the checkpoint's stats (3 cameras,
+        # 32-dim state) for the dataset's, and the export names inputs as model_inputs() expects.
+        # Unlike SmolVLA it applies the constructor's n_action_steps over the checkpoint's, and its
+        # default (50) would win if omitted; Pi05Config rejects a value above the chunk size.
+        chunk = checkpoint_config(args.pretrained)["chunk_size"]
+        lora = {"lora_enabled": True, "lora_rank": args.lora_rank} if args.lora_rank else {}
+        return Pi05(
+            pretrained_name_or_path=args.pretrained,
+            num_inference_steps=args.num_steps,
+            n_action_steps=args.n_action_steps or chunk,
+            **lora,
+        )
 
     from physicalai.policies import SmolVLA
 
@@ -397,12 +438,14 @@ def write_manifest(
     dim = state["shape"][0]  # the converter guarantees action dim == state dim in joints mode
     train_args = {
         "max_epochs": args.max_epochs, "batch_size": args.batch_size,
-        # The trained policy's own values: SmolVLA's chunk size comes from its checkpoint.
+        # The trained policy's own values: VLA chunk sizes come from their checkpoint.
         "chunk_size": policy.config.chunk_size, "n_action_steps": policy.config.n_action_steps,
         "vcodec": args.vcodec, "task": args.task, "export_format": args.export_format,
     }
-    if args.policy == "smolvla":
+    if args.policy in VLAS:
         train_args |= {"pretrained": args.pretrained, "num_steps": args.num_steps}
+    if args.policy == "pi05":
+        train_args["lora_rank"] = args.lora_rank
     manifest = {
         "schema_version": 1,
         "policy": args.policy,
@@ -436,8 +479,9 @@ def write_manifest(
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # Every thread's stack to stderr every 10 minutes, so a cloud job that goes quiet shows where.
-    faulthandler.dump_traceback_later(600, repeat=True)
+    # Stacks to stderr on a fatal signal. Not dump_traceback_later: its timed dumps of running
+    # threads segfaulted Pi0.5 training twice on Viam cloud.
+    faulthandler.enable()
     start = time.monotonic()
     import torch
 
@@ -475,7 +519,7 @@ def main(argv: list[str] | None = None) -> None:
         work = Path(tmp)
         export_dir = resolve_export_dir(args, work)
         check_components(args, export_dir)
-        if args.policy == "smolvla":
+        if args.policy in VLAS:
             check_checkpoint(args)
         try:
             summary = convert_dataset(args, export_dir, work / "dataset")
@@ -491,7 +535,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.policy == "act" and len(summary.tasks_written) > 1:
             logger.warning(
                 "ACT ignores task text, so these %d tasks will blend into one behavior: %s. "
-                "Use --policy=smolvla to condition on the task.",
+                "Use --policy=smolvla or --policy=pi05 to condition on the task.",
                 len(summary.tasks_written), "; ".join(sorted(summary.tasks_written)),
             )
         policy, device = train(args, work / "dataset", work / "ckpt")
