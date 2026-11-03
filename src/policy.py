@@ -137,6 +137,11 @@ def read_package(path: Path | str, *, device: str) -> Package:
             # Not read by the controller: helpers for writing its `cameras` and `arm` config.
             "cameras": {key: component for key, _, component in cameras},
             "arm": action["component"],
+            # The state/action layout per component; packages from before bimanual support have one arm.
+            "components": action.get("components") or [{
+                "component": action["component"], "offset": 0, "dim": int(action["dim"]),
+                "method": "JointPositions", "apply": "MoveToJointPositions", "units": "degrees",
+            }],
         }
         tasks = meta.get("tasks") or [""]
         return Package(
