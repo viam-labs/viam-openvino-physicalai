@@ -66,7 +66,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sequences_file", type=Path, required=True)
     parser.add_argument("--model_output_directory", type=Path, required=True)
     # Custom arguments.
-    parser.add_argument("--arm", required=True, help="follower arm component; source of the state")
+    parser.add_argument(
+        "--arm", type=lambda s: unquote(s).split(), required=True,
+        help="space-separated follower arm components; their joints (each followed by its gripper) form the state",
+    )
+    parser.add_argument(
+        "--grippers", type=lambda s: unquote(s).split(), default=[],
+        help="space-separated gripper components captured with DoCommand, one per arm in the same order",
+    )
+    parser.add_argument(
+        "--gripper_key", default="position", help="numeric field of each gripper's captured DoCommand response"
+    )
     parser.add_argument(
         "--cameras", type=lambda s: unquote(s).split(), required=True,
         help="space-separated camera components; the first is the frame clock",
@@ -112,8 +122,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if not args.cameras:
         parser.error("--cameras must name at least one camera component")
-    if args.action_source == args.arm:
+    if not args.arm:
+        parser.error("--arm must name at least one arm component")
+    if args.grippers and len(args.grippers) != len(args.arm):
+        parser.error(f"--grippers needs one gripper per arm: got {len(args.grippers)} for {len(args.arm)} arms")
+    if args.action_source in args.arm:
         parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
+    if args.action_source != "next_state" and (len(args.arm) > 1 or args.grippers):
+        parser.error("--action_source: leader actions are single-arm only; use next_state")
     if args.lora_rank is not None and args.policy != "pi05":
         parser.error("--lora_rank applies to pi05 only")
     if args.policy in VLAS:
@@ -255,9 +271,11 @@ def check_components(args: argparse.Namespace, export_dir: Path) -> None:
             export_dir / "tabular_data.parquet", columns=["component_name", "method_name"]
         ).to_pylist()
     }
-    arms = [args.arm] if args.action_source == "next_state" else [args.arm, args.action_source]
+    expected = [(arm, "JointPositions") for arm in args.arm] + [(g, "DoCommand") for g in args.grippers]
+    if args.action_source != "next_state":
+        expected.append((args.action_source, "JointPositions"))
     missing = [c for c in args.cameras if c not in cameras]
-    missing += [a for a in arms if (a, "JointPositions") not in readings]
+    missing += [component for component, method in expected if (component, method) not in readings]
     if missing:
         present = sorted({f"{c} (GetImages)" for c in cameras} | {f"{c} ({m})" for c, m in readings})
         raise SystemExit(
@@ -277,7 +295,9 @@ def convert_dataset(args: argparse.Namespace, export_dir: Path, dataset_root: Pa
             repo_id=DATASET_REPO_ID,
             task=args.task,
             camera_components=tuple(args.cameras),
-            arm_component=args.arm,
+            arm_components=tuple(args.arm),
+            grippers=tuple(args.grippers),
+            gripper_key=args.gripper_key,
             action_arm=None if args.action_source == "next_state" else args.action_source,
             fps=args.fps,
             image_size=args.image_size,
@@ -504,11 +524,11 @@ def write_manifest(
         "fps": args.fps,
         "cameras": cameras,
         "image_size": args.image_size,
-        "state": {**state, "component": args.arm, "method": "JointPositions", "units": "degrees", "dim": dim},
+        "state": {**state, "component": args.arm[0], "method": "JointPositions", "units": "degrees", "dim": dim},
         "action": {
             "source": args.action_source,
             "apply": "MoveToJointPositions",
-            "component": args.arm,  # always the follower: that's what gets commanded at inference
+            "component": args.arm[0],  # always the follower: that's what gets commanded at inference
             "units": "degrees",
             "dim": dim,
         },

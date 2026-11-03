@@ -118,12 +118,16 @@ def required_argv(tmp_path: Path) -> list[str]:
         ({"policy": "smolvla", "lora_rank": 8}, "--lora_rank applies to pi05 only"),
         ({"chunk_size": 5, "n_action_steps": 10}, "--n_action_steps"),
         ({"action_source": ARM}, "--action_source"),
+        ({"arm": f"{ARM} other-arm", "grippers": "g1"}, "--grippers needs one gripper per arm"),
+        ({"arm": f"{ARM} other-arm", "action_source": LEADER}, "leader actions are single-arm only"),
+        ({"grippers": "g1", "action_source": LEADER}, "leader actions are single-arm only"),
+        ({"arm": f"other-arm {ARM}", "action_source": ARM}, "--action_source"),
     ],
 )
 def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
     export = build_export(tmp_path, [CAM])
     with pytest.raises(SystemExit) as exc:
-        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, **bad)
+        run(local_files(export), tmp_path / "out", **({"arm": ARM, "cameras": CAM} | bad))
     assert exc.value.code == 2
     assert msg in capsys.readouterr().err
 
@@ -428,3 +432,19 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     assert "loss 3.0000, ~0 min left" in lines[1]
     assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
     assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")
+
+
+def test_arm_and_grippers_parse_as_lists(tmp_path):
+    args = parse_args(required_argv(tmp_path))
+    assert (args.arm, args.grippers, args.gripper_key) == ([ARM], [], "position")
+    files = [f"--{arg}=x" for arg in ARG_FOR_FILE] + [f"--model_output_directory={tmp_path}", f"--cameras={CAM}"]
+    args = parse_args(files + ["--arm='left-arm right-arm'", "--grippers='lg rg'", "--gripper_key=width"])
+    assert (args.arm, args.grippers, args.gripper_key) == (["left-arm", "right-arm"], ["lg", "rg"], "width")
+
+
+def test_missing_gripper_lists_present_components(tmp_path):
+    export = build_export(tmp_path, [CAM])
+    with pytest.raises(SystemExit) as exc:
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, grippers="follower-gripper")
+    message = str(exc.value.code)
+    assert "follower-gripper" in message and "follower-arm (JointPositions)" in message
