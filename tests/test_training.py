@@ -19,6 +19,7 @@ import model.training as training
 from model.training import VCODEC_CANDIDATES, choose_vcodec, main, parse_args, resolve_export_dir
 
 CAM, WRIST, ARM, LEADER = "overhead-cam", "wrist-cam", "follower-arm", "leader-arm"
+LEFT, RIGHT, LEFT_GRIPPER, RIGHT_GRIPPER = "left-arm", "right-arm", "left-gripper", "right-gripper"
 N_JOINTS, TICKS = 6, 15
 BASE = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 ARG_FOR_FILE = {
@@ -39,8 +40,9 @@ def _row(table: dict, seq: str, ts: datetime, component: str, method: str, **dat
 
 
 def build_export(root: Path, cameras: list[str], *, leader_joints=N_JOINTS, absolute=False,
-                 tasks=("pick the cube", "pick the cube")) -> Path:
-    """Write a two-sequence Viam sequence export (follower + leader arm, 10 Hz) and return its dir."""
+                 tasks=("pick the cube", "pick the cube"), bimanual=False) -> Path:
+    """Write a two-sequence Viam sequence export (follower + leader arm, 10 Hz) and return its dir;
+    bimanual=True writes two arms and two DoCommand grippers instead of follower + leader."""
     export = root / "export"
     seqs = ["seq-a", "seq-b"]
     starts = [BASE, BASE + timedelta(minutes=1)]
@@ -62,9 +64,15 @@ def build_export(root: Path, cameras: list[str], *, leader_joints=N_JOINTS, abso
                 pixels = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
                 Image.fromarray(pixels).save(export / rel)
                 _row(binary, seq, ts, cam, "GetImages", path=str(export / rel) if absolute else rel)
-            for arm, n, offset in ((ARM, N_JOINTS, 0.0), (LEADER, leader_joints, 0.5)):
+            arms = ((LEFT, N_JOINTS, 0.0), (RIGHT, N_JOINTS, 10.0)) if bimanual else (
+                (ARM, N_JOINTS, 0.0), (LEADER, leader_joints, 0.5))
+            for arm, n, offset in arms:
                 payload = json.dumps({"positions": {"values": [tick + offset + j for j in range(n)]}})
                 _row(tabular, seq, ts + timedelta(milliseconds=2), arm, "JointPositions", payload=payload)
+            if bimanual:
+                for gripper, offset in ((LEFT_GRIPPER, 0.0), (RIGHT_GRIPPER, 50.0)):
+                    payload = json.dumps({"docommand_output": {"position": tick + offset}})
+                    _row(tabular, seq, ts + timedelta(milliseconds=3), gripper, "DoCommand", payload=payload)
     pq.write_table(pa.table(sequences), export / "sequences.parquet")
     pq.write_table(pa.table(dict(tabular)), export / "tabular_data.parquet")
     pq.write_table(pa.table(dict(binary)), export / "binary_data.parquet")
@@ -483,3 +491,27 @@ def test_missing_gripper_lists_present_components(tmp_path):
         run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, grippers="follower-gripper")
     message = str(exc.value.code)
     assert "follower-gripper" in message and "follower-arm (JointPositions)" in message
+
+
+def test_bimanual_trains_exports_and_runs_inference(tmp_path):
+    from physicalai.inference import InferenceModel
+
+    export = build_export(tmp_path, [CAM, WRIST], bimanual=True)
+    out = tmp_path / "out"
+    run(local_files(export), out, arm=f"{LEFT} {RIGHT}", grippers=f"{LEFT_GRIPPER} {RIGHT_GRIPPER}",
+        cameras=f"{CAM} {WRIST}", max_epochs=1, batch_size=2, vcodec="libsvtav1", chunk_size=10, n_action_steps=5)
+
+    manifest = json.loads((out / "viam.json").read_text())
+    dim = 2 * (N_JOINTS + 1)
+    assert manifest["state"]["dim"] == manifest["action"]["dim"] == dim
+    assert [(c["component"], c["offset"], c["dim"]) for c in manifest["action"]["components"]] == [
+        (LEFT, 0, N_JOINTS), (LEFT_GRIPPER, N_JOINTS, 1), (RIGHT, N_JOINTS + 1, N_JOINTS),
+        (RIGHT_GRIPPER, 2 * N_JOINTS + 1, 1),
+    ]
+    assert manifest["training"]["frames"] == 2 * (TICKS - 1)
+
+    model = InferenceModel(out)
+    obs = {manifest["state"]["input"]: np.zeros((1, *manifest["state"]["shape"]), np.float32)}
+    for cam in manifest["cameras"]:
+        obs[cam["input"]] = np.zeros((1, *cam["shape"]), np.float32)
+    assert model.select_action(obs).shape == (dim,)
