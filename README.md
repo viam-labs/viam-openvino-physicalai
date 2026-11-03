@@ -20,7 +20,7 @@ Configure the [capture control sensor](https://docs.viam.com/data/capture-sync/c
 with:
 - each camera on `GetImages`;
 - each follower arm on `JointPositions`;
-- each gripper on `DoCommand`, with a fixed `docommand_input` whose response holds its position as a number (under `position` unless you set `gripper_key`);
+- each gripper on `DoCommand`, with a fixed `docommand_input` whose response holds its position as a number (under `position` unless you set `gripper_key`). Make it a percentage of the gripper's travel (0–100), not raw driver units: the value is trained on unscaled;
 - optionally, a teleop leader arm on `JointPositions`.
 
 Use the same frequency for all of them, e.g. 10 Hz. Every frame needs a reading from every component within 50 ms, so more components drop more frames when captures drift. Call
