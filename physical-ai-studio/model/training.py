@@ -66,7 +66,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sequences_file", type=Path, required=True)
     parser.add_argument("--model_output_directory", type=Path, required=True)
     # Custom arguments.
-    parser.add_argument("--arm", required=True, help="follower arm component; source of the state")
+    parser.add_argument(
+        "--arm", type=lambda s: unquote(s).split(), required=True,
+        help="space-separated follower arm components; their joints (each followed by its gripper) form the state",
+    )
+    parser.add_argument(
+        "--grippers", type=lambda s: unquote(s).split(), default=[],
+        help="space-separated gripper components captured with DoCommand, one per arm in the same order",
+    )
+    parser.add_argument(
+        "--gripper_key", default="position", help="numeric field of each gripper's captured DoCommand response"
+    )
     parser.add_argument(
         "--cameras", type=lambda s: unquote(s).split(), required=True,
         help="space-separated camera components; the first is the frame clock",
@@ -112,8 +122,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if not args.cameras:
         parser.error("--cameras must name at least one camera component")
-    if args.action_source == args.arm:
+    if not args.arm:
+        parser.error("--arm must name at least one arm component")
+    if args.grippers and len(args.grippers) != len(args.arm):
+        parser.error(f"--grippers needs one gripper per arm: got {len(args.grippers)} for {len(args.arm)} arms")
+    if args.action_source in args.arm:
         parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
+    if args.action_source != "next_state" and (len(args.arm) > 1 or args.grippers):
+        parser.error("--action_source: leader actions are single-arm only; use next_state")
     if args.lora_rank is not None and args.policy != "pi05":
         parser.error("--lora_rank applies to pi05 only")
     if args.policy in VLAS:
@@ -255,9 +271,11 @@ def check_components(args: argparse.Namespace, export_dir: Path) -> None:
             export_dir / "tabular_data.parquet", columns=["component_name", "method_name"]
         ).to_pylist()
     }
-    arms = [args.arm] if args.action_source == "next_state" else [args.arm, args.action_source]
+    expected = [(arm, "JointPositions") for arm in args.arm] + [(g, "DoCommand") for g in args.grippers]
+    if args.action_source != "next_state":
+        expected.append((args.action_source, "JointPositions"))
     missing = [c for c in args.cameras if c not in cameras]
-    missing += [a for a in arms if (a, "JointPositions") not in readings]
+    missing += [component for component, method in expected if (component, method) not in readings]
     if missing:
         present = sorted({f"{c} (GetImages)" for c in cameras} | {f"{c} ({m})" for c, m in readings})
         raise SystemExit(
@@ -277,7 +295,9 @@ def convert_dataset(args: argparse.Namespace, export_dir: Path, dataset_root: Pa
             repo_id=DATASET_REPO_ID,
             task=args.task,
             camera_components=tuple(args.cameras),
-            arm_component=args.arm,
+            arm_components=tuple(args.arm),
+            grippers=tuple(args.grippers),
+            gripper_key=args.gripper_key,
             action_arm=None if args.action_source == "next_state" else args.action_source,
             fps=args.fps,
             image_size=args.image_size,
@@ -369,6 +389,56 @@ def build_policy(args: argparse.Namespace):
     return policy
 
 
+def progress_callback(every_s: float = 60):
+    """A callback logging speed, time spent waiting for data and loss: cloud logs show no progress bar.
+
+    Every `every_s` seconds it logs the window since the last line; at each epoch's end, the epoch's
+    mean loss. Times are wall-clock between hooks, so they include the GPU sync the progress bar forces.
+    """
+    from lightning.pytorch.callbacks import Callback
+
+    class Progress(Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            self.batch_end = None  # the first batch's wait is worker startup, not loading
+            self.epoch_loss, self.epoch_steps, self.epoch_start = 0.0, 0, time.monotonic()
+            self.window(self.epoch_start)
+
+        def window(self, now):
+            self.start, self.steps, self.wait, self.loss = now, 0, 0.0, 0.0
+
+        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            if self.batch_end is not None:
+                self.wait += time.monotonic() - self.batch_end
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            loss = (outputs["loss"] if isinstance(outputs, dict) else outputs).detach()
+            # Summed as tensors: reading .item() every step would add a GPU sync.
+            self.loss, self.epoch_loss = self.loss + loss, self.epoch_loss + loss
+            self.steps += 1
+            self.epoch_steps += 1
+            self.batch_end = now = time.monotonic()
+            if now - self.start < every_s:
+                return
+            per_step = (now - self.start) / self.steps
+            left = (trainer.estimated_stepping_batches - trainer.global_step) * per_step
+            logger.info(
+                "Epoch %d batch %d/%d: %.2f s/step, %.0f%% waiting for data, loss %.4f, ~%.0f min left",
+                trainer.current_epoch, batch_idx + 1, trainer.num_training_batches, per_step,
+                100 * self.wait / (now - self.start), float(self.loss) / self.steps, left / 60,
+            )
+            self.window(now)
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            if self.epoch_steps:
+                logger.info(
+                    "Epoch %d done: mean loss %.4f over %d steps in %.0f min", trainer.current_epoch,
+                    float(self.epoch_loss) / self.epoch_steps, self.epoch_steps,
+                    (time.monotonic() - self.epoch_start) / 60,
+                )
+
+    return Progress()
+
+
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     """Train the policy; return it and the device type it trained on."""
     from physicalai.data import LeRobotDataModule
@@ -388,7 +458,8 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
     # script per rank (re-converting, and every rank exporting to out).
     trainer = Trainer(
-        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir
+        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir,
+        callbacks=[progress_callback()],
     )
     device = trainer.strategy.root_device.type
     if device == "cpu":
@@ -430,12 +501,26 @@ def package_version(name: str) -> str:
     return f"{dist.version}+{commit[:12]}" if commit else dist.version
 
 
+def manifest_components(args: argparse.Namespace, segments) -> list[dict]:
+    """viam.json's state/action layout: one entry per component, in vector order."""
+    components, offset = [], 0
+    for name, dim in segments:
+        if name in args.grippers:
+            how = {"method": "DoCommand", "key": args.gripper_key, "apply": "DoCommand", "units": "as captured"}
+        else:
+            how = {"method": "JointPositions", "apply": "MoveToJointPositions", "units": "degrees"}
+        components.append({"component": name, "offset": offset, "dim": dim, **how})
+        offset += dim
+    return components
+
+
 def write_manifest(
     args, out: Path, summary, policy, device: str, wall_time_s: float, versions: dict[str, str]
 ) -> dict:
     """Write viam.json: what the inference module needs beyond the export's manifest.json."""
     cameras, state = model_inputs(policy, args.cameras)
-    dim = state["shape"][0]  # the converter guarantees action dim == state dim in joints mode
+    dim = state["shape"][0]  # the converter's next-state and leader actions have the state's width
+    components = manifest_components(args, summary.segments)
     train_args = {
         "max_epochs": args.max_epochs, "batch_size": args.batch_size,
         # The trained policy's own values: VLA chunk sizes come from their checkpoint.
@@ -453,13 +538,15 @@ def write_manifest(
         "fps": args.fps,
         "cameras": cameras,
         "image_size": args.image_size,
-        "state": {**state, "component": args.arm, "method": "JointPositions", "units": "degrees", "dim": dim},
+        "state": {**state, "component": args.arm[0], "method": "JointPositions", "units": "degrees", "dim": dim,
+                  "components": [{k: v for k, v in c.items() if k != "apply"} for c in components]},
         "action": {
             "source": args.action_source,
             "apply": "MoveToJointPositions",
-            "component": args.arm,  # always the follower: that's what gets commanded at inference
+            "component": args.arm[0],  # always the follower: that's what gets commanded at inference
             "units": "degrees",
             "dim": dim,
+            "components": components,
         },
         "tasks": sorted(summary.tasks_written),
         "training": {

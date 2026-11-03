@@ -313,3 +313,26 @@ async def test_real_model_serves_a_chunk():
     )
     rows = np.array(out["actions"]["rows"])
     assert rows.shape == (specs["n_action_steps"], specs["action_dim"]) and np.isfinite(rows).all()
+
+
+def test_specs_components_default_to_the_single_arm(tmp_path):
+    s = read_package(write_package(tmp_path / "m"), device="CPU").specs
+    assert s["components"] == [{
+        "component": "arm", "offset": 0, "dim": DIM, "method": "JointPositions",
+        "apply": "MoveToJointPositions", "units": "degrees",
+    }]
+
+
+def test_specs_components_come_from_viam_json(tmp_path):
+    components = [
+        {"component": "left-arm", "offset": 0, "dim": 6, "method": "JointPositions",
+         "apply": "MoveToJointPositions", "units": "degrees"},
+        {"component": "left-gripper", "offset": 6, "dim": 1, "method": "DoCommand", "key": "position",
+         "apply": "DoCommand", "units": "as captured"},
+    ]
+    pkg = read_package(write_package(
+        tmp_path / "m",
+        state={"input": "state", "shape": [7], "component": "left-arm", "dim": 7},
+        action={"component": "left-arm", "dim": 7, "components": components},
+    ), device="CPU")
+    assert pkg.specs["components"] == components and pkg.specs["arm"] == "left-arm"

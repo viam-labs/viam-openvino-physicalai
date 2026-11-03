@@ -19,6 +19,7 @@ import model.training as training
 from model.training import VCODEC_CANDIDATES, choose_vcodec, main, parse_args, resolve_export_dir
 
 CAM, WRIST, ARM, LEADER = "overhead-cam", "wrist-cam", "follower-arm", "leader-arm"
+LEFT, RIGHT, LEFT_GRIPPER, RIGHT_GRIPPER = "left-arm", "right-arm", "left-gripper", "right-gripper"
 N_JOINTS, TICKS = 6, 15
 BASE = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 ARG_FOR_FILE = {
@@ -39,8 +40,9 @@ def _row(table: dict, seq: str, ts: datetime, component: str, method: str, **dat
 
 
 def build_export(root: Path, cameras: list[str], *, leader_joints=N_JOINTS, absolute=False,
-                 tasks=("pick the cube", "pick the cube")) -> Path:
-    """Write a two-sequence Viam sequence export (follower + leader arm, 10 Hz) and return its dir."""
+                 tasks=("pick the cube", "pick the cube"), bimanual=False) -> Path:
+    """Write a two-sequence Viam sequence export (follower + leader arm, 10 Hz) and return its dir;
+    bimanual=True writes two arms and two DoCommand grippers instead of follower + leader."""
     export = root / "export"
     seqs = ["seq-a", "seq-b"]
     starts = [BASE, BASE + timedelta(minutes=1)]
@@ -62,9 +64,15 @@ def build_export(root: Path, cameras: list[str], *, leader_joints=N_JOINTS, abso
                 pixels = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
                 Image.fromarray(pixels).save(export / rel)
                 _row(binary, seq, ts, cam, "GetImages", path=str(export / rel) if absolute else rel)
-            for arm, n, offset in ((ARM, N_JOINTS, 0.0), (LEADER, leader_joints, 0.5)):
+            arms = ((LEFT, N_JOINTS, 0.0), (RIGHT, N_JOINTS, 10.0)) if bimanual else (
+                (ARM, N_JOINTS, 0.0), (LEADER, leader_joints, 0.5))
+            for arm, n, offset in arms:
                 payload = json.dumps({"positions": {"values": [tick + offset + j for j in range(n)]}})
                 _row(tabular, seq, ts + timedelta(milliseconds=2), arm, "JointPositions", payload=payload)
+            if bimanual:
+                for gripper, offset in ((LEFT_GRIPPER, 0.0), (RIGHT_GRIPPER, 50.0)):
+                    payload = json.dumps({"docommand_output": {"position": tick + offset}})
+                    _row(tabular, seq, ts + timedelta(milliseconds=3), gripper, "DoCommand", payload=payload)
     pq.write_table(pa.table(sequences), export / "sequences.parquet")
     pq.write_table(pa.table(dict(tabular)), export / "tabular_data.parquet")
     pq.write_table(pa.table(dict(binary)), export / "binary_data.parquet")
@@ -118,12 +126,16 @@ def required_argv(tmp_path: Path) -> list[str]:
         ({"policy": "smolvla", "lora_rank": 8}, "--lora_rank applies to pi05 only"),
         ({"chunk_size": 5, "n_action_steps": 10}, "--n_action_steps"),
         ({"action_source": ARM}, "--action_source"),
+        ({"arm": f"{ARM} other-arm", "grippers": "g1"}, "--grippers needs one gripper per arm"),
+        ({"arm": f"{ARM} other-arm", "action_source": LEADER}, "leader actions are single-arm only"),
+        ({"grippers": "g1", "action_source": LEADER}, "leader actions are single-arm only"),
+        ({"arm": f"other-arm {ARM}", "action_source": ARM}, "--action_source"),
     ],
 )
 def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
     export = build_export(tmp_path, [CAM])
     with pytest.raises(SystemExit) as exc:
-        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, **bad)
+        run(local_files(export), tmp_path / "out", **({"arm": ARM, "cameras": CAM} | bad))
     assert exc.value.code == 2
     assert msg in capsys.readouterr().err
 
@@ -204,6 +216,8 @@ def test_trains_exports_and_runs_inference(tmp_path, layout, export_format):
     assert manifest["action"] == {
         "source": action_source, "apply": "MoveToJointPositions", "component": ARM,
         "units": "degrees", "dim": N_JOINTS,
+        "components": [{"component": ARM, "offset": 0, "dim": N_JOINTS, "method": "JointPositions",
+                        "apply": "MoveToJointPositions", "units": "degrees"}],
     }
     assert manifest["tasks"] == ["pick the cube"]
     assert manifest["training"]["args"]["chunk_size"] == 10
@@ -401,11 +415,103 @@ def test_manifest_records_pi05_training_args(tmp_path):
         inputs_schema=[feature("images", (3, 8, 8)), feature("state", (N_JOINTS,)), feature("task", ())],
         config=SimpleNamespace(chunk_size=50, n_action_steps=10),
     )
-    summary = SimpleNamespace(tasks_written={"open the box"}, episodes_written=1, frames_written=2, skipped=[])
+    summary = SimpleNamespace(tasks_written={"open the box"}, episodes_written=1, frames_written=2, skipped=[],
+                              segments=((ARM, N_JOINTS),))
     out = tmp_path / "out"
     out.mkdir()
     manifest = training.write_manifest(args, out, summary, policy, "cuda", 1.0, {})
+    assert manifest["action"]["components"] == [
+        {"component": ARM, "offset": 0, "dim": N_JOINTS, "method": "JointPositions",
+         "apply": "MoveToJointPositions", "units": "degrees"}]
     train_args = manifest["training"]["args"]
     assert manifest["policy"] == "pi05"
     assert (train_args["pretrained"], train_args["num_steps"], train_args["lora_rank"]) == ("lerobot/pi05_base", 10, 8)
     assert (train_args["chunk_size"], train_args["n_action_steps"]) == (50, 10)
+
+
+def test_manifest_components_bimanual(tmp_path):
+    files = [f"--{arg}=x" for arg in ARG_FOR_FILE] + [f"--model_output_directory={tmp_path}", f"--cameras={CAM}"]
+    args = parse_args(files + ["--arm=left-arm right-arm", "--grippers=left-gripper right-gripper"])
+    dim = 2 * (N_JOINTS + 1)
+    feature = lambda name, shape: SimpleNamespace(name=name, shape=shape)  # noqa: E731
+    policy = SimpleNamespace(
+        inputs_schema=[feature("images", (3, 8, 8)), feature("state", (dim,))],
+        config=SimpleNamespace(chunk_size=10, n_action_steps=5),
+    )
+    segments = (("left-arm", N_JOINTS), ("left-gripper", 1), ("right-arm", N_JOINTS), ("right-gripper", 1))
+    summary = SimpleNamespace(tasks_written={"t"}, episodes_written=1, frames_written=2, skipped=[], segments=segments)
+    out = tmp_path / "out"
+    out.mkdir()
+    manifest = training.write_manifest(args, out, summary, policy, "cpu", 1.0, {})
+
+    arm = {"method": "JointPositions", "apply": "MoveToJointPositions", "units": "degrees"}
+    grip = {"method": "DoCommand", "key": "position", "apply": "DoCommand", "units": "as captured"}
+    assert manifest["action"]["components"] == [
+        {"component": "left-arm", "offset": 0, "dim": N_JOINTS, **arm},
+        {"component": "left-gripper", "offset": N_JOINTS, "dim": 1, **grip},
+        {"component": "right-arm", "offset": N_JOINTS + 1, "dim": N_JOINTS, **arm},
+        {"component": "right-gripper", "offset": 2 * N_JOINTS + 1, "dim": 1, **grip},
+    ]
+    assert all("apply" not in c for c in manifest["state"]["components"])
+    assert [c["component"] for c in manifest["state"]["components"]] == [name for name, _ in segments]
+    assert manifest["action"]["component"] == manifest["state"]["component"] == "left-arm"
+    assert manifest["action"]["dim"] == manifest["state"]["dim"] == dim
+
+
+def test_progress_callback_logs_speed_wait_and_loss(caplog):
+    import torch
+
+    cb = training.progress_callback(every_s=0)
+    trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0)
+    caplog.set_level("INFO", logger="physical-ai-studio")
+    cb.on_train_epoch_start(trainer, None)
+    for i, loss in enumerate([1.0, 3.0]):
+        cb.on_train_batch_start(trainer, None, None, i)
+        trainer.global_step += 1
+        cb.on_train_batch_end(trainer, None, {"loss": torch.tensor(loss)}, None, i)
+    cb.on_train_epoch_end(trainer, None)
+    lines = [r.getMessage() for r in caplog.records]
+    assert "Epoch 0 batch 1/2:" in lines[0] and "waiting for data, loss 1.0000" in lines[0]
+    assert "loss 3.0000, ~0 min left" in lines[1]
+    assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
+    assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")
+
+
+def test_arm_and_grippers_parse_as_lists(tmp_path):
+    args = parse_args(required_argv(tmp_path))
+    assert (args.arm, args.grippers, args.gripper_key) == ([ARM], [], "position")
+    files = [f"--{arg}=x" for arg in ARG_FOR_FILE] + [f"--model_output_directory={tmp_path}", f"--cameras={CAM}"]
+    args = parse_args(files + ["--arm='left-arm right-arm'", "--grippers='lg rg'", "--gripper_key=width"])
+    assert (args.arm, args.grippers, args.gripper_key) == (["left-arm", "right-arm"], ["lg", "rg"], "width")
+
+
+def test_missing_gripper_lists_present_components(tmp_path):
+    export = build_export(tmp_path, [CAM])
+    with pytest.raises(SystemExit) as exc:
+        run(local_files(export), tmp_path / "out", arm=ARM, cameras=CAM, grippers="follower-gripper")
+    message = str(exc.value.code)
+    assert "follower-gripper" in message and "follower-arm (JointPositions)" in message
+
+
+def test_bimanual_trains_exports_and_runs_inference(tmp_path):
+    from physicalai.inference import InferenceModel
+
+    export = build_export(tmp_path, [CAM, WRIST], bimanual=True)
+    out = tmp_path / "out"
+    run(local_files(export), out, arm=f"{LEFT} {RIGHT}", grippers=f"{LEFT_GRIPPER} {RIGHT_GRIPPER}",
+        cameras=f"{CAM} {WRIST}", max_epochs=1, batch_size=2, vcodec="libsvtav1", chunk_size=10, n_action_steps=5)
+
+    manifest = json.loads((out / "viam.json").read_text())
+    dim = 2 * (N_JOINTS + 1)
+    assert manifest["state"]["dim"] == manifest["action"]["dim"] == dim
+    assert [(c["component"], c["offset"], c["dim"]) for c in manifest["action"]["components"]] == [
+        (LEFT, 0, N_JOINTS), (LEFT_GRIPPER, N_JOINTS, 1), (RIGHT, N_JOINTS + 1, N_JOINTS),
+        (RIGHT_GRIPPER, 2 * N_JOINTS + 1, 1),
+    ]
+    assert manifest["training"]["frames"] == 2 * (TICKS - 1)
+
+    model = InferenceModel(out)
+    obs = {manifest["state"]["input"]: np.zeros((1, *manifest["state"]["shape"]), np.float32)}
+    for cam in manifest["cameras"]:
+        obs[cam["input"]] = np.zeros((1, *cam["shape"]), np.float32)
+    assert model.select_action(obs).shape == (dim,)
