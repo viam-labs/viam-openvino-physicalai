@@ -409,3 +409,22 @@ def test_manifest_records_pi05_training_args(tmp_path):
     assert manifest["policy"] == "pi05"
     assert (train_args["pretrained"], train_args["num_steps"], train_args["lora_rank"]) == ("lerobot/pi05_base", 10, 8)
     assert (train_args["chunk_size"], train_args["n_action_steps"]) == (50, 10)
+
+
+def test_progress_callback_logs_speed_wait_and_loss(caplog):
+    import torch
+
+    cb = training.progress_callback(every_s=0)
+    trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0)
+    caplog.set_level("INFO", logger="physical-ai-studio")
+    cb.on_train_epoch_start(trainer, None)
+    for i, loss in enumerate([1.0, 3.0]):
+        cb.on_train_batch_start(trainer, None, None, i)
+        trainer.global_step += 1
+        cb.on_train_batch_end(trainer, None, {"loss": torch.tensor(loss)}, None, i)
+    cb.on_train_epoch_end(trainer, None)
+    lines = [r.getMessage() for r in caplog.records]
+    assert "Epoch 0 batch 1/2:" in lines[0] and "waiting for data, loss 1.0000" in lines[0]
+    assert "loss 3.0000, ~0 min left" in lines[1]
+    assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
+    assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")

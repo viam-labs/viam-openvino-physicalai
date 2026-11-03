@@ -369,6 +369,56 @@ def build_policy(args: argparse.Namespace):
     return policy
 
 
+def progress_callback(every_s: float = 60):
+    """A callback logging speed, time spent waiting for data and loss: cloud logs show no progress bar.
+
+    Every `every_s` seconds it logs the window since the last line; at each epoch's end, the epoch's
+    mean loss. Times are wall-clock between hooks, so they include the GPU sync the progress bar forces.
+    """
+    from lightning.pytorch.callbacks import Callback
+
+    class Progress(Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            self.batch_end = None  # the first batch's wait is worker startup, not loading
+            self.epoch_loss, self.epoch_steps, self.epoch_start = 0.0, 0, time.monotonic()
+            self.window(self.epoch_start)
+
+        def window(self, now):
+            self.start, self.steps, self.wait, self.loss = now, 0, 0.0, 0.0
+
+        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            if self.batch_end is not None:
+                self.wait += time.monotonic() - self.batch_end
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            loss = (outputs["loss"] if isinstance(outputs, dict) else outputs).detach()
+            # Summed as tensors: reading .item() every step would add a GPU sync.
+            self.loss, self.epoch_loss = self.loss + loss, self.epoch_loss + loss
+            self.steps += 1
+            self.epoch_steps += 1
+            self.batch_end = now = time.monotonic()
+            if now - self.start < every_s:
+                return
+            per_step = (now - self.start) / self.steps
+            left = (trainer.estimated_stepping_batches - trainer.global_step) * per_step
+            logger.info(
+                "Epoch %d batch %d/%d: %.2f s/step, %.0f%% waiting for data, loss %.4f, ~%.0f min left",
+                trainer.current_epoch, batch_idx + 1, trainer.num_training_batches, per_step,
+                100 * self.wait / (now - self.start), float(self.loss) / self.steps, left / 60,
+            )
+            self.window(now)
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            if self.epoch_steps:
+                logger.info(
+                    "Epoch %d done: mean loss %.4f over %d steps in %.0f min", trainer.current_epoch,
+                    float(self.epoch_loss) / self.epoch_steps, self.epoch_steps,
+                    (time.monotonic() - self.epoch_start) / 60,
+                )
+
+    return Progress()
+
+
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     """Train the policy; return it and the device type it trained on."""
     from physicalai.data import LeRobotDataModule
@@ -388,7 +438,8 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
     # script per rank (re-converting, and every rank exporting to out).
     trainer = Trainer(
-        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir
+        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir,
+        callbacks=[progress_callback()],
     )
     device = trainer.strategy.root_device.type
     if device == "cpu":
