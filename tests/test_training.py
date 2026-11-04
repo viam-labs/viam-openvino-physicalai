@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -130,6 +132,9 @@ def required_argv(tmp_path: Path) -> list[str]:
         ({"arm": f"{ARM} other-arm", "action_source": LEADER}, "leader actions are single-arm only"),
         ({"grippers": "g1", "action_source": LEADER}, "leader actions are single-arm only"),
         ({"arm": f"other-arm {ARM}", "action_source": ARM}, "--action_source"),
+        ({"devices": 0}, "--devices"),
+        ({"devices": -1}, "--devices"),
+        ({"devices": "two"}, "--devices"),
     ],
 )
 def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
@@ -462,7 +467,8 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     import torch
 
     cb = training.progress_callback(every_s=0)
-    trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0)
+    trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0,
+                              is_global_zero=True)
     caplog.set_level("INFO", logger="physical-ai-studio")
     cb.on_train_epoch_start(trainer, None)
     for i, loss in enumerate([1.0, 3.0]):
@@ -475,6 +481,21 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     assert "loss 3.0000, ~0 min left" in lines[1]
     assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
     assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")
+
+
+def test_progress_callback_is_silent_off_rank_zero(caplog):
+    import torch
+
+    cb = training.progress_callback(every_s=0)
+    trainer = SimpleNamespace(current_epoch=0, num_training_batches=1, estimated_stepping_batches=1,
+                              global_step=0, is_global_zero=False)
+    caplog.set_level("INFO", logger="physical-ai-studio")
+    cb.on_train_epoch_start(trainer, None)
+    cb.on_train_batch_start(trainer, None, None, 0)
+    trainer.global_step += 1
+    cb.on_train_batch_end(trainer, None, {"loss": torch.tensor(1.0)}, None, 0)
+    cb.on_train_epoch_end(trainer, None)
+    assert caplog.records == []
 
 
 def test_arm_and_grippers_parse_as_lists(tmp_path):
@@ -515,3 +536,56 @@ def test_bimanual_trains_exports_and_runs_inference(tmp_path):
     for cam in manifest["cameras"]:
         obs[cam["input"]] = np.zeros((1, *cam["shape"]), np.float32)
     assert model.select_action(obs).shape == (dim,)
+
+
+def test_devices_defaults_to_auto(tmp_path):
+    assert parse_args(required_argv(tmp_path)).devices == "auto"
+    assert parse_args([*required_argv(tmp_path), "--devices=2"]).devices == 2
+    assert parse_args([*required_argv(tmp_path), "--devices='auto'"]).devices == "auto"
+
+
+@pytest.mark.parametrize("requested, gpus, expected", [(2, 0, 2), ("auto", 0, 1), ("auto", 2, 2), (1, 2, 1)])
+def test_resolve_devices_returns_an_int(monkeypatch, requested, gpus, expected):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: gpus)
+    assert training.resolve_devices(requested) == expected
+
+
+def test_extra_rank_without_work_dir_exits_before_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.delenv("PHYSICALAI_WORK", raising=False)
+    monkeypatch.setattr(training, "resolve_export_dir", lambda *a: pytest.fail("rank 1 staged the export"))
+    with pytest.raises(SystemExit, match="PHYSICALAI_WORK is unset"):
+        main(required_argv(tmp_path))
+
+
+def test_extra_rank_only_trains_on_rank_zeros_work_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("PHYSICALAI_WORK", str(tmp_path / "work"))
+    monkeypatch.setattr(training, "resolve_export_dir", lambda *a: pytest.fail("rank 1 staged the export"))
+    calls = []
+    monkeypatch.setattr(training, "train", lambda args, dataset, ckpt: calls.append((dataset, ckpt)))
+    main(required_argv(tmp_path))
+    assert calls == [(tmp_path / "work" / "dataset", tmp_path / "work" / "ckpt")]
+    assert not (tmp_path / "out" / "viam.json").exists()
+
+
+def test_two_process_ddp_trains_and_exports_once(tmp_path):
+    # A subprocess, not main(): under pytest, Lightning would relaunch pytest itself for rank 1.
+    export = build_export(tmp_path, [CAM])
+    out = tmp_path / "out"
+    argv = [f"--{arg}={path}" for arg, path in local_files(export).items()] + [
+        f"--model_output_directory={out}", f"--arm={ARM}", f"--cameras={CAM}", "--devices=2",
+        "--max_epochs=1", "--batch_size=2", "--vcodec=libsvtav1", "--chunk_size=10", "--n_action_steps=5",
+    ]
+    env = {k: v for k, v in os.environ.items() if k not in ("LOCAL_RANK", "PHYSICALAI_WORK")}
+    result = subprocess.run([sys.executable, "-m", "model.training", *argv],
+                            capture_output=True, text=True, timeout=1800, env=env)
+    log = result.stdout + result.stderr
+    assert result.returncode == 0, log[-4000:]
+    assert log.count("Training on 2 × cpu, effective batch 4 (batch_size 2 per device)") == 1
+    assert log.count("Rank 1: training only") == 1
+    assert log.count("sequences skipped, device") == 1  # main()'s "Done:" line: rank 1 never exports
+    assert (out / "act.xml").is_file()
+    assert json.loads((out / "viam.json").read_text())["training"]["frames"] == 2 * (TICKS - 1)

@@ -56,6 +56,20 @@ def unquote(value: str) -> str:
     return value.strip("'\"")
 
 
+def devices_arg(value: str) -> int | str:
+    """argparse type for --devices: "auto" or a positive int."""
+    value = unquote(value)
+    if value == "auto":
+        return value
+    try:
+        count = int(value)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise argparse.ArgumentTypeError(f"must be auto or a positive integer, got {value!r}")
+    return count
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse Viam's arguments strictly: an unknown or misspelled custom arg exits 2."""
     # allow_abbrev=False: otherwise a truncated typo like --max_epoch silently matches --max_epochs.
@@ -118,6 +132,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--n_action_steps", type=int, default=None,
         help="actions executed per inference (default: the chunk size)",
+    )
+    parser.add_argument(
+        "--devices", type=devices_arg, default="auto",
+        help="GPUs to train on: auto (every visible GPU, one process on CPU) or a count; batch_size is per device",
     )
     args = parser.parse_args(argv)
     if not args.cameras:
@@ -394,11 +412,14 @@ def progress_callback(every_s: float = 60):
 
     Every `every_s` seconds it logs the window since the last line; at each epoch's end, the epoch's
     mean loss. Times are wall-clock between hooks, so they include the GPU sync the progress bar forces.
+    Rank 0 only; under DDP the loss is rank 0's share of each step.
     """
     from lightning.pytorch.callbacks import Callback
 
     class Progress(Callback):
         def on_train_epoch_start(self, trainer, pl_module):
+            if not trainer.is_global_zero:
+                return
             self.batch_end = None  # the first batch's wait is worker startup, not loading
             self.epoch_loss, self.epoch_steps, self.epoch_start = 0.0, 0, time.monotonic()
             self.window(self.epoch_start)
@@ -407,10 +428,14 @@ def progress_callback(every_s: float = 60):
             self.start, self.steps, self.wait, self.loss = now, 0, 0.0, 0.0
 
         def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            if not trainer.is_global_zero:
+                return
             if self.batch_end is not None:
                 self.wait += time.monotonic() - self.batch_end
 
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            if not trainer.is_global_zero:
+                return
             loss = (outputs["loss"] if isinstance(outputs, dict) else outputs).detach()
             # Summed as tensors: reading .item() every step would add a GPU sync.
             self.loss, self.epoch_loss = self.loss + loss, self.epoch_loss + loss
@@ -429,6 +454,8 @@ def progress_callback(every_s: float = 60):
             self.window(now)
 
         def on_train_epoch_end(self, trainer, pl_module):
+            if not trainer.is_global_zero:
+                return
             if self.epoch_steps:
                 logger.info(
                     "Epoch %d done: mean loss %.4f over %d steps in %.0f min", trainer.current_epoch,
@@ -437,6 +464,15 @@ def progress_callback(every_s: float = 60):
                 )
 
     return Progress()
+
+
+def resolve_devices(requested: int | str) -> int:
+    """The Trainer's device count. Always an int: physicalai's Trainer switches to
+    DDPStrategy(find_unused_parameters=True), which Pi0.5's frozen weights need, only for an int > 1.
+    Every rank resolves it the same way, since they share CUDA_VISIBLE_DEVICES."""
+    import torch
+
+    return (torch.cuda.device_count() or 1) if requested == "auto" else requested
 
 
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
@@ -451,21 +487,25 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     if shm < 1 << 30:
         logger.warning("/dev/shm is only %d MiB: loading data in the main process (num_workers=0)", shm >> 20)
         workers["num_workers"] = 0
+        os.environ.setdefault("NCCL_SHM_DISABLE", "1")  # multi-GPU: NCCL's buffers live in /dev/shm too
     datamodule = LeRobotDataModule(
         repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
     )
     policy = build_policy(args)
-    # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
-    # script per rank (re-converting, and every rank exporting to out).
+    # More than one device means DDP: Lightning re-runs this script for each extra rank, and
+    # main() sends those ranks straight back here (see PHYSICALAI_WORK).
     trainer = Trainer(
-        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir,
-        callbacks=[progress_callback()],
+        max_epochs=args.max_epochs, accelerator="auto", devices=resolve_devices(args.devices),
+        default_root_dir=ckpt_dir, callbacks=[progress_callback()],
     )
     device = trainer.strategy.root_device.type
     if device == "cpu":
         logger.warning("Training on CPU: expected for local runs, but in a cloud job no GPU was found")
-    else:
-        logger.info("Training on %s", trainer.strategy.root_device)
+    if trainer.is_global_zero:
+        logger.info(
+            "Training on %d × %s, effective batch %d (batch_size %d per device)",
+            trainer.world_size, device, args.batch_size * trainer.world_size, args.batch_size,
+        )
     trainer.fit(model=policy, datamodule=datamodule)
     return policy, device
 
@@ -569,6 +609,18 @@ def main(argv: list[str] | None = None) -> None:
     # Stacks to stderr on a fatal signal. Not dump_traceback_later: its timed dumps of running
     # threads segfaulted Pi0.5 training twice on Viam cloud.
     faulthandler.enable()
+    rank = os.environ.get("LOCAL_RANK", "0")
+    if rank != "0":
+        # Lightning's DDP launcher re-runs this script for each extra device, with the same
+        # arguments. Such a rank only trains, on the dataset rank 0 converted.
+        work = os.environ.get("PHYSICALAI_WORK")
+        if not work:
+            raise SystemExit(
+                f"LOCAL_RANK={rank} but PHYSICALAI_WORK is unset: ranks > 0 are started by Lightning from a rank-0 job"
+            )
+        logger.info("Rank %s: training only", rank)
+        train(args, Path(work) / "dataset", Path(work) / "ckpt")
+        return
     start = time.monotonic()
     import torch
 
@@ -625,6 +677,7 @@ def main(argv: list[str] | None = None) -> None:
                 "Use --policy=smolvla or --policy=pi05 to condition on the task.",
                 len(summary.tasks_written), "; ".join(sorted(summary.tasks_written)),
             )
+        os.environ["PHYSICALAI_WORK"] = str(work)  # inherited by the ranks Lightning starts in fit()
         policy, device = train(args, work / "dataset", work / "ckpt")
         policy.export(out, backend=args.export_format)
     manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)
