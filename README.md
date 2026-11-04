@@ -97,7 +97,13 @@ included at `/opt/licenses/GEMMA_TERMS.txt`.
 ```sh
 COPYFILE_DISABLE=1 tar --exclude=__pycache__ -czf physical-ai-studio.tar.gz physical-ai-studio/
 viam training-script upload --path=physical-ai-studio.tar.gz --org-id=<org> \
-  --script-name=physical-ai-studio --version=1 --framework=unspecified
+  --script-name=physical-ai-studio --version=1 --type=robot_policy \
+  --framework=registry --module-resource=viam-labs:openvino-physicalai:policy \
+  --url=https://github.com/viam-labs/viam-openvino-physicalai
+# Once, to describe the script in the registry (update requires --visibility):
+viam training-script update --org-id=<org> --script-name=physical-ai-studio --visibility=private \
+  --framework=registry --module-resource=viam-labs:openvino-physicalai:policy \
+  --description="Train robot policies (ACT, SmolVLA, Pi0.5) on a Viam sequence dataset with Intel physicalai."
 viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
   --model-name=<name> --model-version=1 --version=1 \
   --script-name=<org-id>:physical-ai-studio --container-id=<container-id> \
@@ -107,7 +113,8 @@ viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
 viam train logs --job-id=<job-id>
 ```
 
-Re-uploading the script? Bump `--version` on upload and submit together.
+Re-uploading the script? Bump `--version` on upload and submit together. `--module-resource` needs
+`--framework=registry`, which deploys the trained model together with the policy module.
 
 Run the job in the dataset's org: reading another org's images fails with
 `OSError: [Errno 5] Input/output error` on `/gcs/...`. Cloud jobs copy the images to local disk with the Cloud Storage transfer manager
