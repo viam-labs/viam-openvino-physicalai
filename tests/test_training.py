@@ -548,3 +548,22 @@ def test_resolve_devices_returns_an_int(monkeypatch, requested, gpus, expected):
 
     monkeypatch.setattr(torch.cuda, "device_count", lambda: gpus)
     assert training.resolve_devices(requested) == expected
+
+
+def test_extra_rank_without_work_dir_exits_before_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.delenv("PHYSICALAI_WORK", raising=False)
+    monkeypatch.setattr(training, "resolve_export_dir", lambda *a: pytest.fail("rank 1 staged the export"))
+    with pytest.raises(SystemExit, match="PHYSICALAI_WORK is unset"):
+        main(required_argv(tmp_path))
+
+
+def test_extra_rank_only_trains_on_rank_zeros_work_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("PHYSICALAI_WORK", str(tmp_path / "work"))
+    monkeypatch.setattr(training, "resolve_export_dir", lambda *a: pytest.fail("rank 1 staged the export"))
+    calls = []
+    monkeypatch.setattr(training, "train", lambda args, dataset, ckpt: calls.append((dataset, ckpt)))
+    main(required_argv(tmp_path))
+    assert calls == [(tmp_path / "work" / "dataset", tmp_path / "work" / "ckpt")]
+    assert not (tmp_path / "out" / "viam.json").exists()

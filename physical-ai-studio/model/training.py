@@ -608,6 +608,18 @@ def main(argv: list[str] | None = None) -> None:
     # Stacks to stderr on a fatal signal. Not dump_traceback_later: its timed dumps of running
     # threads segfaulted Pi0.5 training twice on Viam cloud.
     faulthandler.enable()
+    rank = os.environ.get("LOCAL_RANK", "0")
+    if rank != "0":
+        # Lightning's DDP launcher re-runs this script for each extra device, with the same
+        # arguments. Such a rank only trains, on the dataset rank 0 converted.
+        work = os.environ.get("PHYSICALAI_WORK")
+        if not work:
+            raise SystemExit(
+                f"LOCAL_RANK={rank} but PHYSICALAI_WORK is unset: ranks > 0 are started by Lightning from a rank-0 job"
+            )
+        logger.info("Rank %s: training only", rank)
+        train(args, Path(work) / "dataset", Path(work) / "ckpt")
+        return
     start = time.monotonic()
     import torch
 
@@ -664,6 +676,7 @@ def main(argv: list[str] | None = None) -> None:
                 "Use --policy=smolvla or --policy=pi05 to condition on the task.",
                 len(summary.tasks_written), "; ".join(sorted(summary.tasks_written)),
             )
+        os.environ["PHYSICALAI_WORK"] = str(work)  # inherited by the ranks Lightning starts in fit()
         policy, device = train(args, work / "dataset", work / "ckpt")
         policy.export(out, backend=args.export_format)
     manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)
