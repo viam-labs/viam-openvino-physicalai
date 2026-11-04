@@ -586,5 +586,6 @@ def test_two_process_ddp_trains_and_exports_once(tmp_path):
     assert result.returncode == 0, log[-4000:]
     assert log.count("Training on 2 × cpu, effective batch 4 (batch_size 2 per device)") == 1
     assert log.count("Rank 1: training only") == 1
+    assert log.count("sequences skipped, device") == 1  # main()'s "Done:" line: rank 1 never exports
     assert (out / "act.xml").is_file()
     assert json.loads((out / "viam.json").read_text())["training"]["frames"] == 2 * (TICKS - 1)
