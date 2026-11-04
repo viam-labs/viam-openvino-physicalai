@@ -56,6 +56,20 @@ def unquote(value: str) -> str:
     return value.strip("'\"")
 
 
+def devices_arg(value: str) -> int | str:
+    """argparse type for --devices: "auto" or a positive int."""
+    value = unquote(value)
+    if value == "auto":
+        return value
+    try:
+        count = int(value)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise argparse.ArgumentTypeError(f"must be auto or a positive integer, got {value!r}")
+    return count
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse Viam's arguments strictly: an unknown or misspelled custom arg exits 2."""
     # allow_abbrev=False: otherwise a truncated typo like --max_epoch silently matches --max_epochs.
@@ -118,6 +132,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--n_action_steps", type=int, default=None,
         help="actions executed per inference (default: the chunk size)",
+    )
+    parser.add_argument(
+        "--devices", type=devices_arg, default="auto",
+        help="GPUs to train on: auto (every visible GPU, one process on CPU) or a count; batch_size is per device",
     )
     args = parser.parse_args(argv)
     if not args.cameras:
@@ -439,6 +457,15 @@ def progress_callback(every_s: float = 60):
     return Progress()
 
 
+def resolve_devices(requested: int | str) -> int:
+    """The Trainer's device count. Always an int: physicalai's Trainer switches to
+    DDPStrategy(find_unused_parameters=True), which Pi0.5's frozen weights need, only for an int > 1.
+    Every rank resolves it the same way, since they share CUDA_VISIBLE_DEVICES."""
+    import torch
+
+    return (torch.cuda.device_count() or 1) if requested == "auto" else requested
+
+
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     """Train the policy; return it and the device type it trained on."""
     from physicalai.data import LeRobotDataModule
@@ -455,17 +482,20 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
         repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
     )
     policy = build_policy(args)
-    # devices=1: on a multi-GPU host, "auto" picks DDP, whose launcher re-runs this whole
-    # script per rank (re-converting, and every rank exporting to out).
+    # More than one device means DDP: Lightning re-runs this script for each extra rank, and
+    # main() sends those ranks straight back here (see PHYSICALAI_WORK).
     trainer = Trainer(
-        max_epochs=args.max_epochs, accelerator="auto", devices=1, default_root_dir=ckpt_dir,
-        callbacks=[progress_callback()],
+        max_epochs=args.max_epochs, accelerator="auto", devices=resolve_devices(args.devices),
+        default_root_dir=ckpt_dir, callbacks=[progress_callback()],
     )
     device = trainer.strategy.root_device.type
     if device == "cpu":
         logger.warning("Training on CPU: expected for local runs, but in a cloud job no GPU was found")
-    else:
-        logger.info("Training on %s", trainer.strategy.root_device)
+    if trainer.is_global_zero:
+        logger.info(
+            "Training on %d × %s, effective batch %d (batch_size %d per device)",
+            trainer.world_size, device, args.batch_size * trainer.world_size, args.batch_size,
+        )
     trainer.fit(model=policy, datamodule=datamodule)
     return policy, device
 

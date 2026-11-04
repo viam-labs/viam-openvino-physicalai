@@ -130,6 +130,9 @@ def required_argv(tmp_path: Path) -> list[str]:
         ({"arm": f"{ARM} other-arm", "action_source": LEADER}, "leader actions are single-arm only"),
         ({"grippers": "g1", "action_source": LEADER}, "leader actions are single-arm only"),
         ({"arm": f"other-arm {ARM}", "action_source": ARM}, "--action_source"),
+        ({"devices": 0}, "--devices"),
+        ({"devices": -1}, "--devices"),
+        ({"devices": "two"}, "--devices"),
     ],
 )
 def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
@@ -515,3 +518,17 @@ def test_bimanual_trains_exports_and_runs_inference(tmp_path):
     for cam in manifest["cameras"]:
         obs[cam["input"]] = np.zeros((1, *cam["shape"]), np.float32)
     assert model.select_action(obs).shape == (dim,)
+
+
+def test_devices_defaults_to_auto(tmp_path):
+    assert parse_args(required_argv(tmp_path)).devices == "auto"
+    assert parse_args([*required_argv(tmp_path), "--devices=2"]).devices == 2
+    assert parse_args([*required_argv(tmp_path), "--devices='auto'"]).devices == "auto"
+
+
+@pytest.mark.parametrize("requested, gpus, expected", [(2, 0, 2), ("auto", 0, 1), ("auto", 2, 2), (1, 2, 1)])
+def test_resolve_devices_returns_an_int(monkeypatch, requested, gpus, expected):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: gpus)
+    assert training.resolve_devices(requested) == expected
