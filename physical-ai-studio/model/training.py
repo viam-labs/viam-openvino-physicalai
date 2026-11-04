@@ -487,6 +487,7 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     if shm < 1 << 30:
         logger.warning("/dev/shm is only %d MiB: loading data in the main process (num_workers=0)", shm >> 20)
         workers["num_workers"] = 0
+        os.environ.setdefault("NCCL_SHM_DISABLE", "1")  # multi-GPU: NCCL's buffers live in /dev/shm too
     datamodule = LeRobotDataModule(
         repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
     )
