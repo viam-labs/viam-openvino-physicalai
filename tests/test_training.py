@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -567,3 +569,22 @@ def test_extra_rank_only_trains_on_rank_zeros_work_dir(tmp_path, monkeypatch):
     main(required_argv(tmp_path))
     assert calls == [(tmp_path / "work" / "dataset", tmp_path / "work" / "ckpt")]
     assert not (tmp_path / "out" / "viam.json").exists()
+
+
+def test_two_process_ddp_trains_and_exports_once(tmp_path):
+    # A subprocess, not main(): under pytest, Lightning would relaunch pytest itself for rank 1.
+    export = build_export(tmp_path, [CAM])
+    out = tmp_path / "out"
+    argv = [f"--{arg}={path}" for arg, path in local_files(export).items()] + [
+        f"--model_output_directory={out}", f"--arm={ARM}", f"--cameras={CAM}", "--devices=2",
+        "--max_epochs=1", "--batch_size=2", "--vcodec=libsvtav1", "--chunk_size=10", "--n_action_steps=5",
+    ]
+    env = {k: v for k, v in os.environ.items() if k not in ("LOCAL_RANK", "PHYSICALAI_WORK")}
+    result = subprocess.run([sys.executable, "-m", "model.training", *argv],
+                            capture_output=True, text=True, timeout=1800, env=env)
+    log = result.stdout + result.stderr
+    assert result.returncode == 0, log[-4000:]
+    assert log.count("Training on 2 × cpu, effective batch 4 (batch_size 2 per device)") == 1
+    assert log.count("Rank 1: training only") == 1
+    assert (out / "act.xml").is_file()
+    assert json.loads((out / "viam.json").read_text())["training"]["frames"] == 2 * (TICKS - 1)
