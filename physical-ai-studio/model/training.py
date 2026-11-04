@@ -412,11 +412,14 @@ def progress_callback(every_s: float = 60):
 
     Every `every_s` seconds it logs the window since the last line; at each epoch's end, the epoch's
     mean loss. Times are wall-clock between hooks, so they include the GPU sync the progress bar forces.
+    Rank 0 only; under DDP the loss is rank 0's share of each step.
     """
     from lightning.pytorch.callbacks import Callback
 
     class Progress(Callback):
         def on_train_epoch_start(self, trainer, pl_module):
+            if not trainer.is_global_zero:
+                return
             self.batch_end = None  # the first batch's wait is worker startup, not loading
             self.epoch_loss, self.epoch_steps, self.epoch_start = 0.0, 0, time.monotonic()
             self.window(self.epoch_start)
@@ -425,10 +428,14 @@ def progress_callback(every_s: float = 60):
             self.start, self.steps, self.wait, self.loss = now, 0, 0.0, 0.0
 
         def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            if not trainer.is_global_zero:
+                return
             if self.batch_end is not None:
                 self.wait += time.monotonic() - self.batch_end
 
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            if not trainer.is_global_zero:
+                return
             loss = (outputs["loss"] if isinstance(outputs, dict) else outputs).detach()
             # Summed as tensors: reading .item() every step would add a GPU sync.
             self.loss, self.epoch_loss = self.loss + loss, self.epoch_loss + loss
@@ -447,6 +454,8 @@ def progress_callback(every_s: float = 60):
             self.window(now)
 
         def on_train_epoch_end(self, trainer, pl_module):
+            if not trainer.is_global_zero:
+                return
             if self.epoch_steps:
                 logger.info(
                     "Epoch %d done: mean loss %.4f over %d steps in %.0f min", trainer.current_epoch,

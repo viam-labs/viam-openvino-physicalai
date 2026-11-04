@@ -465,7 +465,8 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     import torch
 
     cb = training.progress_callback(every_s=0)
-    trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0)
+    trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0,
+                              is_global_zero=True)
     caplog.set_level("INFO", logger="physical-ai-studio")
     cb.on_train_epoch_start(trainer, None)
     for i, loss in enumerate([1.0, 3.0]):
@@ -478,6 +479,21 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     assert "loss 3.0000, ~0 min left" in lines[1]
     assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
     assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")
+
+
+def test_progress_callback_is_silent_off_rank_zero(caplog):
+    import torch
+
+    cb = training.progress_callback(every_s=0)
+    trainer = SimpleNamespace(current_epoch=0, num_training_batches=1, estimated_stepping_batches=1,
+                              global_step=0, is_global_zero=False)
+    caplog.set_level("INFO", logger="physical-ai-studio")
+    cb.on_train_epoch_start(trainer, None)
+    cb.on_train_batch_start(trainer, None, None, 0)
+    trainer.global_step += 1
+    cb.on_train_batch_end(trainer, None, {"loss": torch.tensor(1.0)}, None, 0)
+    cb.on_train_epoch_end(trainer, None)
+    assert caplog.records == []
 
 
 def test_arm_and_grippers_parse_as_lists(tmp_path):
