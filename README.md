@@ -52,7 +52,8 @@ blends every task into one behavior (the training job warns when that happens).
 | `workers` | half the cores with `image_size` | conversion processes; otherwise the converter's choice |
 | `task` | unset | instruction for sequences without a `cmd:` tag |
 | `max_epochs` | `100` | |
-| `batch_size` | `8` | |
+| `batch_size` | `8` | per device; a multi-GPU job logs the effective batch (batch_size × GPUs) |
+| `devices` | `auto` | GPUs to train on: `auto` uses every visible GPU, with distributed data parallel (DDP) when there are several, which halves the steps per epoch on two; `1` forces one |
 | `chunk_size` | `100` | act only: actions predicted per inference; 100 is about 10 s at 10 fps. smolvla's and pi05's are fixed by `pretrained` (50) |
 | `n_action_steps` | the chunk size | actions executed before predicting again (≤ the chunk size); lower means the policy replans more often |
 
