@@ -122,7 +122,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers", type=int, default=None,
         help="conversion processes (default: half the cores with --image_size, else the converter's choice)",
     )
-    parser.add_argument("--task", type=unquote, default=None, help="instruction for sequences without a cmd: tag")
+    parser.add_argument("--task", type=unquote, default=None, help="instruction for sequences without a cmd: or task: tag")
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument(

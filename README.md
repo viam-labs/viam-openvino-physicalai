@@ -24,7 +24,7 @@ with:
 - optionally, a teleop leader arm on `JointPositions`.
 
 Use the same frequency for all of them, e.g. 10 Hz. Every frame needs a reading from every component within 50 ms, so more components drop more frames when captures drift. Call
-`start_capture` with `{"tags": ["cmd:<instruction>"]}` at the start of each
+`start_capture` with `{"tags": ["cmd:<instruction>"]}` (or `task:<instruction>`) at the start of each
 demonstration and `stop_capture` at the end. Each pair becomes one sequence, and
 each sequence becomes one training episode. Add the sequences to a sequence dataset.
 
@@ -50,7 +50,7 @@ blends every task into one behavior (the training job warns when that happens).
 | `image_size` | unset | downscale the longest image side; also ACT's input size. `224` makes jobs much faster |
 | `vcodec` | `auto` | `auto` uses the first of `h264_nvenc`, `h264`, `libsvtav1` that can encode on the machine |
 | `workers` | half the cores with `image_size` | conversion processes; otherwise the converter's choice |
-| `task` | unset | instruction for sequences without a `cmd:` tag |
+| `task` | unset | instruction for sequences without a `cmd:` or `task:` tag |
 | `max_epochs` | `100` | |
 | `batch_size` | `8` | per device; a multi-GPU job logs the effective batch (batch_size × GPUs) |
 | `devices` | `auto` | GPUs to train on: `auto` uses every visible GPU, with distributed data parallel (DDP) when there are several, which halves the steps per epoch on two; `1` forces one |
