@@ -22,6 +22,7 @@ import time
 from importlib import metadata
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 logger = logging.getLogger("physical-ai-studio")
@@ -97,6 +98,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--gripper_key", default="position", help="numeric field of each gripper's captured DoCommand response"
     )
     parser.add_argument(
+        "--gripper_open", type=float, default=None,
+        help="raw gripper reading when fully open: rescales each gripper to 0..1 with 0 = open, "
+        "the scale viam-labs:vla:controller's do_command gripper feeds the policy (1 - value/gripper_open)",
+    )
+    parser.add_argument(
         "--cameras", type=lambda s: unquote(s).split(), required=True,
         help="space-separated camera components; the first is the frame clock",
     )
@@ -158,6 +164,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--arm must name at least one arm component")
     if args.grippers and len(args.grippers) != len(args.arm):
         parser.error(f"--grippers needs one gripper per arm: got {len(args.grippers)} for {len(args.arm)} arms")
+    if args.gripper_open is not None and (not args.grippers or args.gripper_open <= 0):
+        parser.error("--gripper_open needs --grippers and a positive value")
     if args.action_source in args.arm:
         parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
     if args.action_source != "next_state" and (len(args.arm) > 1 or args.grippers):
@@ -315,6 +323,47 @@ def check_components(args: argparse.Namespace, export_dir: Path) -> None:
         raise SystemExit(
             f"Components not found in the export: {', '.join(missing)}. Present: {', '.join(present)}"
         )
+
+
+def normalize_grippers(args: argparse.Namespace, export_dir: Path, work: Path) -> Path:
+    """With --gripper_open, return an export whose gripper readings are 1 - value/gripper_open, clamped to 0..1.
+
+    The vla controller's do_command gripper gives the policy 0..1 with 0 = open, so a gripper
+    recorded raw (e.g. viam:ufactory:gripper's pos, 840 = open) must be trained on that scale.
+    """
+    if args.gripper_open is None:
+        return export_dir
+    out = work / "normalized"
+    out.mkdir()
+    table = pq.read_table(export_dir / "tabular_data.parquet")
+    names = table.column("component_name").to_pylist()
+    payloads = table.column("payload").to_pylist()
+    grippers, rescaled = set(args.grippers), []
+    for i, name in enumerate(names):
+        if name not in grippers:
+            continue
+        payload = json.loads(payloads[i])
+        output = payload.get("docommand_output")
+        value = output.get(args.gripper_key) if isinstance(output, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            output[args.gripper_key] = min(1.0, max(0.0, 1.0 - value / args.gripper_open))
+            payloads[i] = json.dumps(payload)
+            rescaled.append(value)
+    if rescaled:
+        logger.info("Rescaled %d gripper readings (raw %g..%g) to 0..1 with 0 = open (gripper_open=%g)",
+                    len(rescaled), min(rescaled), max(rescaled), args.gripper_open)
+    field = table.schema.field("payload")  # reused so the column keeps its type and not-null flag
+    pq.write_table(table.set_column(table.schema.get_field_index("payload"), field, pa.array(payloads, field.type)),
+                   out / "tabular_data.parquet")
+    # Relative image paths only resolve against the original export directory.
+    binary = pq.read_table(export_dir / "binary_data.parquet")
+    paths = [p if p.startswith("/") else str((export_dir / p).resolve())
+             for p in binary.column("path").to_pylist()]
+    field = binary.schema.field("path")
+    pq.write_table(binary.set_column(binary.schema.get_field_index("path"), field, pa.array(paths, field.type)),
+                   out / "binary_data.parquet")
+    (out / "sequences.parquet").symlink_to((export_dir / "sequences.parquet").resolve())
+    return out
 
 
 def convert_dataset(args: argparse.Namespace, export_dir: Path, dataset_root: Path):
@@ -593,7 +642,8 @@ def manifest_components(args: argparse.Namespace, segments) -> list[dict]:
     components, offset = [], 0
     for name, dim in segments:
         if name in args.grippers:
-            how = {"method": "DoCommand", "key": args.gripper_key, "apply": "DoCommand", "units": "as captured"}
+            units = "0..1, 0 = open" if args.gripper_open is not None else "as captured"
+            how = {"method": "DoCommand", "key": args.gripper_key, "apply": "DoCommand", "units": units}
         else:
             how = {"method": "JointPositions", "apply": "MoveToJointPositions", "units": "degrees"}
         components.append({"component": name, "offset": offset, "dim": dim, **how})
@@ -609,7 +659,7 @@ def write_manifest(
     dim = state["shape"][0]  # the converter's next-state and leader actions have the state's width
     components = manifest_components(args, summary.segments)
     train_args = {
-        "max_epochs": args.max_epochs, "batch_size": args.batch_size,
+        "max_epochs": args.max_epochs, "batch_size": args.batch_size, "gripper_open": args.gripper_open,
         # The trained policy's own values: VLA chunk sizes come from their checkpoint.
         "chunk_size": policy.config.chunk_size, "n_action_steps": policy.config.n_action_steps,
         "vcodec": args.vcodec, "task": args.task, "export_format": args.export_format,
@@ -706,6 +756,7 @@ def main(argv: list[str] | None = None) -> None:
         work = Path(tmp)
         export_dir = resolve_export_dir(args, work)
         check_components(args, export_dir)
+        export_dir = normalize_grippers(args, export_dir, work)
         if args.policy in VLAS:
             check_checkpoint(args)
         try:
