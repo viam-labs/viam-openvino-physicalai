@@ -94,6 +94,34 @@ included at `/opt/licenses/GEMMA_TERMS.txt`.
 
 ## 5. Upload and train
 
+### Train with the registered script and container
+
+The script is public in the viam-dev org (`e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb`). The container is
+registered in the hackathons org (`6d6c7293-bc67-43e4-9c8b-31c76aac27d3`) and is private to it:
+
+| | ID | version |
+|---|---|---|
+| training script | `e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio` | `9` |
+| container | `1045eccc-b3b7-48fe-86cf-5230b82c336d` | `hipsterbrown/viam-openvino-physicalai:0.3.0-5` |
+
+Run the job, and keep the dataset, in the hackathons org:
+
+```sh
+viam train submit custom from-registry --dataset-id=<dataset-id> \
+  --org-id=6d6c7293-bc67-43e4-9c8b-31c76aac27d3 \
+  --model-name=<model-name> --model-version=1 \
+  --script-name=e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio --version=9 \
+  --container-id=1045eccc-b3b7-48fe-86cf-5230b82c336d \
+  --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",image_size=224
+viam train logs --job-id=<job-id>
+```
+
+Pick the policy and other options with `--args` (see [Custom arguments](#2-custom-arguments)),
+e.g. `--args=arm=xarm,cameras="'realsense-cam webcam'",policy=pi05,fps=30,image_size=224,max_epochs=1`.
+Update the IDs here when you upload a new script version or register a new container.
+
+### Upload your own
+
 ```sh
 COPYFILE_DISABLE=1 tar --exclude=__pycache__ -czf physical-ai-studio.tar.gz physical-ai-studio/
 viam training-script upload --path=physical-ai-studio.tar.gz --org-id=<org> \
