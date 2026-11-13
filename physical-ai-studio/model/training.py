@@ -40,6 +40,11 @@ LORA_RANK = 32
 ACT_CHUNK_SIZE = 100
 # physicalai ExportBackend values offered here; ACT supports both.
 EXPORT_FORMATS = ("openvino", "onnx")
+# Lightning's precision strings; the default (unset) leaves Lightning's own 32-true.
+PRECISIONS = ("32-true", "16-mixed", "bf16-mixed", "bf16-true")
+WEIGHT_COMPRESSIONS = ("none", "int8", "int4")
+# NNCF's usual int4 group size: one scale per 128 weights keeps accuracy close to int8.
+INT4_GROUP_SIZE = 128
 # Names the converter's load_export() requires, in Viam's argument order below.
 PARQUET_FILES = ("sequences.parquet", "tabular_data.parquet", "binary_data.parquet")
 # --vcodec auto tries these in order and uses the first that can actually encode here:
@@ -102,6 +107,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--policy", choices=POLICIES, default="act")
     parser.add_argument("--export_format", choices=EXPORT_FORMATS, default="openvino")
     parser.add_argument(
+        "--weight_compression", choices=WEIGHT_COMPRESSIONS, default="none",
+        help="compress the exported OpenVINO model's weights with NNCF (int4 keeps some layers in int8)",
+    )
+    parser.add_argument(
+        "--precision", choices=PRECISIONS, default=None,
+        help="Lightning training precision (default: Lightning's 32-true). smolvla/pi05 already hold "
+             "their weights in bf16, so this mainly speeds up act",
+    )
+    parser.add_argument(
         "--pretrained", default=None,
         help="smolvla/pi05: checkpoint to fine-tune (Hugging Face id or local directory; "
              "default " + ", ".join(f"{p}: {c}" for p, c in PRETRAINED.items()) + ")",
@@ -148,6 +162,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--action_source must differ from --arm (use next_state for the follower's next pose)")
     if args.action_source != "next_state" and (len(args.arm) > 1 or args.grippers):
         parser.error("--action_source: leader actions are single-arm only; use next_state")
+    if args.weight_compression != "none" and args.export_format != "openvino":
+        parser.error("--weight_compression applies to the openvino export only")
     if args.lora_rank is not None and args.policy != "pi05":
         parser.error("--lora_rank applies to pi05 only")
     if args.policy in VLAS:
@@ -497,6 +513,7 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     trainer = Trainer(
         max_epochs=args.max_epochs, accelerator="auto", devices=resolve_devices(args.devices),
         default_root_dir=ckpt_dir, callbacks=[progress_callback()],
+        precision=args.precision,
     )
     device = trainer.strategy.root_device.type
     if device == "cpu":
@@ -508,6 +525,36 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
         )
     trainer.fit(model=policy, datamodule=datamodule)
     return policy, device
+
+
+def openvino_model_path(out: Path) -> Path:
+    """The export's model graph, named by its manifest, never the sibling tokenizer.xml."""
+    from physicalai.inference.manifest import Manifest
+
+    return out / Manifest.load(out).model.artifacts["openvino"]
+
+
+def compress_weights(out: Path, mode: str) -> None:
+    """Compress the exported OpenVINO model's weights in place with NNCF (data-free)."""
+    import nncf  # only the compression path needs it; the container installs it via the nncf extra
+    import openvino as ov
+
+    xml = openvino_model_path(out)
+    size = lambda: (xml.stat().st_size + xml.with_suffix(".bin").stat().st_size) / 2**20  # noqa: E731
+    before = size()
+    model = ov.Core().read_model(xml)
+    if mode == "int8":
+        compressed = nncf.compress_weights(model, mode=nncf.CompressWeightsMode.INT8_ASYM)
+    else:  # layers the group size doesn't divide stay int8 (NNCF's backup mode)
+        compressed = nncf.compress_weights(model, mode=nncf.CompressWeightsMode.INT4_ASYM, group_size=INT4_GROUP_SIZE)
+    # OpenVINO mmaps the .bin it read, so write beside it and swap rather than overwrite.
+    # compress_to_fp16=False: keep the uncompressed ops as the export left them.
+    tmp = xml.with_name("compressed.xml")
+    ov.save_model(compressed, tmp, compress_to_fp16=False)
+    del compressed, model
+    tmp.replace(xml)
+    tmp.with_suffix(".bin").replace(xml.with_suffix(".bin"))
+    logger.info("%s weights: %s %.1f MiB -> %.1f MiB", mode, xml.name, before, size())
 
 
 def model_inputs(policy, cameras: list[str]) -> tuple[list[dict], dict]:
@@ -566,6 +613,7 @@ def write_manifest(
         # The trained policy's own values: VLA chunk sizes come from their checkpoint.
         "chunk_size": policy.config.chunk_size, "n_action_steps": policy.config.n_action_steps,
         "vcodec": args.vcodec, "task": args.task, "export_format": args.export_format,
+        "precision": args.precision, "weight_compression": args.weight_compression,
     }
     if args.policy in VLAS:
         train_args |= {"pretrained": args.pretrained, "num_steps": args.num_steps}
@@ -680,6 +728,8 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["PHYSICALAI_WORK"] = str(work)  # inherited by the ranks Lightning starts in fit()
         policy, device = train(args, work / "dataset", work / "ckpt")
         policy.export(out, backend=args.export_format)
+        if args.weight_compression != "none":
+            compress_weights(out, args.weight_compression)
     manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)
     logger.info(
         "Done: %d episodes, %d frames, %d sequences skipped, device %s, %ds",

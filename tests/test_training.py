@@ -132,6 +132,9 @@ def required_argv(tmp_path: Path) -> list[str]:
         ({"arm": f"{ARM} other-arm", "action_source": LEADER}, "leader actions are single-arm only"),
         ({"grippers": "g1", "action_source": LEADER}, "leader actions are single-arm only"),
         ({"arm": f"other-arm {ARM}", "action_source": ARM}, "--action_source"),
+        ({"export_format": "onnx", "weight_compression": "int8"}, "openvino export only"),
+        ({"weight_compression": "int2"}, "invalid choice: 'int2'"),
+        ({"precision": "8-bit"}, "invalid choice: '8-bit'"),
         ({"devices": 0}, "--devices"),
         ({"devices": -1}, "--devices"),
         ({"devices": "two"}, "--devices"),
@@ -149,6 +152,20 @@ def test_export_format_defaults_to_openvino(tmp_path):
     base = required_argv(tmp_path)
     assert parse_args(base).export_format == "openvino"
     assert parse_args([*base, "--export_format=onnx"]).export_format == "onnx"
+
+
+def test_precision_and_compression_defaults(tmp_path):
+    args = parse_args(required_argv(tmp_path))
+    assert args.precision is None and args.weight_compression == "none"
+    args = parse_args([*required_argv(tmp_path), "--precision=bf16-mixed", "--weight_compression=int4"])
+    assert args.precision == "bf16-mixed" and args.weight_compression == "int4"
+
+
+def test_compression_targets_the_model_not_the_tokenizer(tmp_path):
+    (tmp_path / "manifest.json").write_text(json.dumps({"model": {"artifacts": {"openvino": "pi05.xml"}}}))
+    for name in ("pi05.xml", "tokenizer.xml"):
+        (tmp_path / name).touch()
+    assert training.openvino_model_path(tmp_path) == tmp_path / "pi05.xml"
 
 
 def test_chunk_defaults_per_policy(tmp_path):
