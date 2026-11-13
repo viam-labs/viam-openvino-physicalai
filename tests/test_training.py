@@ -606,3 +606,29 @@ def test_two_process_ddp_trains_and_exports_once(tmp_path):
     assert log.count("sequences skipped, device") == 1  # main()'s "Done:" line: rank 1 never exports
     assert (out / "act.xml").is_file()
     assert json.loads((out / "viam.json").read_text())["training"]["frames"] == 2 * (TICKS - 1)
+
+
+def test_gripper_open_rescales_raw_grippers_to_unit_open_zero(tmp_path):
+    """--gripper_open turns a raw reading (840 = open) into the vla controller's 0..1, 0 = open."""
+    export = tmp_path / "export"
+    export.mkdir()
+    tabular = pa.table({
+        "component_name": ["gripper", "gripper", "gripper", "arm"],
+        "method_name": ["DoCommand", "DoCommand", "DoCommand", "JointPositions"],
+        "payload": [json.dumps({"docommand_output": {"pos": v}}) for v in (840, 0, 900)] + ['{"joints": [1]}'],
+    })
+    pq.write_table(tabular, export / "tabular_data.parquet")
+    pq.write_table(pa.table({"path": ["binary_data/a.jpg"]}), export / "binary_data.parquet")
+    pq.write_table(pa.table({"sequence_id": ["s"]}), export / "sequences.parquet")
+    args = parse_args([
+        "--binary_data_file=x", "--tabular_data_file=x", "--sequences_file=x", "--model_output_directory=x",
+        f"--arm={ARM}", "--grippers=gripper", "--gripper_key=pos", f"--cameras={CAM}", "--gripper_open=840",
+    ])
+    out = training.normalize_grippers(args, export, tmp_path)
+    payloads = pq.read_table(out / "tabular_data.parquet").column("payload").to_pylist()
+    assert [json.loads(p)["docommand_output"]["pos"] for p in payloads[:3]] == [0.0, 1.0, 0.0]
+    assert payloads[3] == '{"joints": [1]}'
+    assert pq.read_table(out / "binary_data.parquet").column("path").to_pylist() == [
+        str((export / "binary_data/a.jpg").resolve())
+    ]
+    assert training.manifest_components(args, [(ARM, 6), ("gripper", 1)])[1]["units"] == "0..1, 0 = open"
