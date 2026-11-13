@@ -39,6 +39,7 @@ blends every task into one behavior (the training job warns when that happens).
 | `arm` | required | space-separated follower arm components; with several, state and action are `[arm1 joints, gripper1, arm2 joints, gripper2]` |
 | `grippers` | unset | space-separated grippers captured with `DoCommand`, one per arm in the same order |
 | `gripper_key` | `position` | numeric field of each gripper's `DoCommand` response |
+| `gripper_open` | unset | the raw gripper reading when fully open (e.g. `840` for `viam:ufactory:gripper`'s `pos`): rescales each gripper to `1 - value/gripper_open`, clamped to 0..1 with 0 = open, the scale `viam-labs:vla:controller` feeds the policy. Needs `grippers`; the units are recorded in `viam.json` |
 | `cameras` | required | space-separated camera components; the first is the frame clock |
 | `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`); leader arms are single-arm only, without grippers |
 | `policy` | `act` | or `smolvla`, a vision-language-action model conditioned on the task text, or `pi05`, Physical Intelligence's Pi0.5 (~3.6B parameters, LoRA fine-tuned) |
