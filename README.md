@@ -104,8 +104,8 @@ registered in the hackathons org (`6d6c7293-bc67-43e4-9c8b-31c76aac27d3`) and is
 
 | | ID | version |
 |---|---|---|
-| training script | `e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio` | `9` |
-| container | `1045eccc-b3b7-48fe-86cf-5230b82c336d` | `hipsterbrown/viam-openvino-physicalai:0.3.0-5` |
+| training script | `e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio` | `11` |
+| container | `587f03ad-1d10-4888-9f7f-5d271e5225bd` | `hipsterbrown/viam-openvino-physicalai:0.3.0-6` |
 
 Run the job, and keep the dataset, in the hackathons org:
 
@@ -113,8 +113,8 @@ Run the job, and keep the dataset, in the hackathons org:
 viam train submit custom from-registry --dataset-id=<dataset-id> \
   --org-id=6d6c7293-bc67-43e4-9c8b-31c76aac27d3 \
   --model-name=<model-name> --model-version=1 \
-  --script-name=e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio --version=9 \
-  --container-id=1045eccc-b3b7-48fe-86cf-5230b82c336d \
+  --script-name=e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio --version=11 \
+  --container-id=587f03ad-1d10-4888-9f7f-5d271e5225bd \
   --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",image_size=224
 viam train logs --job-id=<job-id>
 ```
