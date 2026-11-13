@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN test -n "$CONVERTER_REF" \
     && pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
-        "physicalai-train[cu128]==${PHYSICALAI_VERSION}" \
+        "physicalai-train[cu128,nncf]==${PHYSICALAI_VERSION}" \
         torch==2.11.0 torchvision==0.26.0 torchcodec==0.11.1 \
         "nvidia-npp-cu12==12.3.3.*" \
         "viam-sequence-to-lerobot @ git+https://github.com/viam-labs/viam-sequence-to-lerobot@${CONVERTER_REF}" \

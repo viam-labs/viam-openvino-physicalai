@@ -43,6 +43,8 @@ blends every task into one behavior (the training job warns when that happens).
 | `action_source` | `next_state` | or a leader arm component whose `JointPositions` is the action (same joint count as `arm`); leader arms are single-arm only, without grippers |
 | `policy` | `act` | or `smolvla`, a vision-language-action model conditioned on the task text, or `pi05`, Physical Intelligence's Pi0.5 (~3.6B parameters, LoRA fine-tuned) |
 | `export_format` | `openvino` | or `onnx`, for targets without OpenVINO; the module runs ONNX on CPU only; smolvla and pi05 are `openvino` only |
+| `precision` | Lightning's `32-true` | or `16-mixed`, `bf16-mixed`, `bf16-true`. smolvla and pi05 already hold their weights in bf16, so this mainly speeds up act |
+| `weight_compression` | `none` | or `int8` / `int4`: compress the exported OpenVINO model's weights with NNCF (the model graph only, not `tokenizer.xml`), which shrinks `*.bin` and speeds up CPU inference at some accuracy cost; int4 uses groups of 128 and keeps sensitive layers in int8. `openvino` export only |
 | `pretrained` | `lerobot/smolvla_base` / `lerobot/pi05_base` | smolvla/pi05: checkpoint to fine-tune (Hugging Face id or directory). The job downloads it (about 1 GB for `smolvla_base`, 15 GB for `pi05_base`), so it needs Hugging Face access |
 | `num_steps` | `10` | smolvla/pi05: denoising steps per inference |
 | `lora_rank` | `32` | pi05 only: LoRA adapter rank; 0 fine-tunes every weight, which does not fit a 40 GB GPU |
