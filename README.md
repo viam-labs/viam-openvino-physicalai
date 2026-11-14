@@ -134,10 +134,12 @@ viam training-script upload --path=physical-ai-studio.tar.gz --org-id=<org> \
   --script-name=physical-ai-studio --version=1 --type=robot_policy \
   --framework=registry --module-resource=viam-labs:openvino-physicalai:policy \
   --url=https://github.com/viam-labs/viam-openvino-physicalai
-# Once, to describe the script in the registry (update requires --visibility):
+# To describe the script in the registry, and again whenever the arguments change
+# (update requires --visibility):
 viam training-script update --org-id=<org> --script-name=physical-ai-studio --visibility=private \
   --framework=registry --module-resource=viam-labs:openvino-physicalai:policy \
-  --description="Train robot policies (ACT, SmolVLA, Pi0.5) on a Viam sequence dataset with Intel physicalai."
+  --url=https://github.com/viam-labs/viam-openvino-physicalai \
+  --description="$(cat training-script-description.txt)"
 viam train submit custom from-registry --dataset-id=<ds> --org-id=<org> \
   --model-name=<name> --model-version=1 --version=1 \
   --script-name=<org-id>:physical-ai-studio --container-id=<container-id> \
