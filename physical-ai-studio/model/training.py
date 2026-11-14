@@ -44,6 +44,8 @@ EXPORT_FORMATS = ("openvino", "onnx")
 # Lightning's precision strings; the default (unset) leaves Lightning's own 32-true.
 PRECISIONS = ("32-true", "16-mixed", "bf16-mixed", "bf16-true")
 WEIGHT_COMPRESSIONS = ("none", "int8", "int4")
+# Held-out episode fraction when --patience is set without --val_split.
+VAL_SPLIT = 0.1
 # NNCF's usual int4 group size: one scale per 128 weights keeps accuracy close to int8.
 INT4_GROUP_SIZE = 128
 # Names the converter's load_export() requires, in Viam's argument order below.
@@ -146,6 +148,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument(
+        "--val_split", type=float, default=None,
+        help=f"fraction of episodes held out for a validation loss each epoch (default {VAL_SPLIT} with --patience, else none)",
+    )
+    parser.add_argument(
+        "--patience", type=int, default=None,
+        help="stop after this many epochs without the validation loss improving by --min_delta (default: off)",
+    )
+    parser.add_argument("--min_delta", type=float, default=0.0, help="smallest validation loss drop that counts as improvement")
+    parser.add_argument(
         "--chunk_size", type=int, default=None,
         help=f"act only: actions predicted per inference (default {ACT_CHUNK_SIZE})",
     )
@@ -172,6 +183,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--action_source: leader actions are single-arm only; use next_state")
     if args.weight_compression != "none" and args.export_format != "openvino":
         parser.error("--weight_compression applies to the openvino export only")
+    if args.patience is not None and args.patience < 1:
+        parser.error("--patience must be at least 1")
+    if args.min_delta < 0:
+        parser.error("--min_delta must be 0 or more")
+    if args.val_split is None and args.patience is not None:
+        args.val_split = VAL_SPLIT
+    if args.val_split is not None and not 0 < args.val_split < 1:
+        parser.error("--val_split must be between 0 and 1")
     if args.lora_rank is not None and args.policy != "pi05":
         parser.error("--lora_rank applies to pi05 only")
     if args.policy in VLAS:
@@ -522,10 +541,13 @@ def progress_callback(every_s: float = 60):
             if not trainer.is_global_zero:
                 return
             if self.epoch_steps:
+                # Epoch-end validation runs before this hook, so its loss is this epoch's.
+                val = trainer.callback_metrics.get("val/loss")
                 logger.info(
-                    "Epoch %d done: mean loss %.4f over %d steps in %.0f min", trainer.current_epoch,
+                    "Epoch %d done: mean loss %.4f over %d steps in %.0f min%s", trainer.current_epoch,
                     float(self.epoch_loss) / self.epoch_steps, self.epoch_steps,
                     (time.monotonic() - self.epoch_start) / 60,
+                    "" if val is None else f", val loss {float(val):.4f}",
                 )
 
     return Progress()
@@ -542,6 +564,8 @@ def resolve_devices(requested: int | str) -> int:
 
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
     """Train the policy; return it and the device type it trained on."""
+    import torch
+    from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
     from physicalai.data import LeRobotDataModule
     from physicalai.train import Trainer
 
@@ -553,15 +577,25 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
         logger.warning("/dev/shm is only %d MiB: loading data in the main process (num_workers=0)", shm >> 20)
         workers["num_workers"] = 0
         os.environ.setdefault("NCCL_SHM_DISABLE", "1")  # multi-GPU: NCCL's buffers live in /dev/shm too
+    # A fixed seed: every DDP rank must hold out the same episodes.
+    val = {"val_split": args.val_split, "val_split_seed": 0} if args.val_split else {}
     datamodule = LeRobotDataModule(
-        repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers
+        repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers, **val
     )
     policy = build_policy(args)
+    callbacks = [progress_callback()]
+    if args.val_split:
+        # Replaces Lightning's default keep-the-last-epoch checkpoint with the best one, exported below.
+        best = ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=1)
+        callbacks.append(best)
+    if args.patience:
+        callbacks.append(EarlyStopping(monitor="val/loss", mode="min", patience=args.patience,
+                                       min_delta=args.min_delta, verbose=True))
     # More than one device means DDP: Lightning re-runs this script for each extra rank, and
     # main() sends those ranks straight back here (see PHYSICALAI_WORK).
     trainer = Trainer(
         max_epochs=args.max_epochs, accelerator="auto", devices=resolve_devices(args.devices),
-        default_root_dir=ckpt_dir, callbacks=[progress_callback()],
+        default_root_dir=ckpt_dir, callbacks=callbacks,
         precision=args.precision,
     )
     device = trainer.strategy.root_device.type
@@ -573,6 +607,10 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
             trainer.world_size, device, args.batch_size * trainer.world_size, args.batch_size,
         )
     trainer.fit(model=policy, datamodule=datamodule)
+    if args.val_split and best.best_model_path:
+        logger.info("Exporting epoch with the best val loss %.4f: %s", float(best.best_model_score), best.best_model_path)
+        state = torch.load(best.best_model_path, map_location="cpu", weights_only=False)["state_dict"]
+        policy.load_state_dict(state)
     return policy, device
 
 
@@ -664,6 +702,7 @@ def write_manifest(
         "chunk_size": policy.config.chunk_size, "n_action_steps": policy.config.n_action_steps,
         "vcodec": args.vcodec, "task": args.task, "export_format": args.export_format,
         "precision": args.precision, "weight_compression": args.weight_compression,
+        "val_split": args.val_split, "patience": args.patience, "min_delta": args.min_delta,
     }
     if args.policy in VLAS:
         train_args |= {"pretrained": args.pretrained, "num_steps": args.num_steps}
