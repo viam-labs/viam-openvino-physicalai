@@ -1,0 +1,7 @@
+Train robot policies (ACT, SmolVLA, Pi0.5) on a Viam sequence dataset with Intel physicalai, exported to OpenVINO or ONNX for the viam-labs:openvino-physicalai:policy module. Pass args as --args=key=value,...; quote lists, e.g. cameras="'cam1 cam2'".
+Required: arm (follower arm components, space-separated), cameras (camera components; the first is the frame clock).
+Data: grippers (unset; one DoCommand gripper per arm), gripper_key (position), gripper_open (unset; raw open reading, rescales to 0..1 with 0 = open), action_source (next_state, or a leader arm), task (unset; for sequences without a cmd: or task: tag), fps (10; must match capture frequency_hz), image_size (unset; 224 is much faster), vcodec (auto), workers (half the cores with image_size).
+Policy: policy (act; or smolvla, pi05), pretrained (lerobot/smolvla_base or lerobot/pi05_base), num_steps (10; smolvla/pi05 denoising steps), lora_rank (32; pi05 only, 0 = full fine-tune), chunk_size (100; act only), n_action_steps (the chunk size).
+Training: max_epochs (100), batch_size (8 per device), devices (auto = every GPU), precision (32-true; or 16-mixed, bf16-mixed, bf16-true), patience (unset; stop after N epochs without val loss improvement), min_delta (0), val_split (0.1 with patience, else unset; best val-loss epoch is exported).
+Export: export_format (openvino; or onnx, act only), weight_compression (none; or int8, int4, openvino only).
+Full docs: https://github.com/viam-labs/viam-openvino-physicalai#2-custom-arguments
