@@ -55,6 +55,9 @@ blends every task into one behavior (the training job warns when that happens).
 | `workers` | half the cores with `image_size` | conversion processes; otherwise the converter's choice |
 | `task` | unset | instruction for sequences without a `cmd:` or `task:` tag |
 | `max_epochs` | `100` | |
+| `patience` | unset | stop early after this many epochs without the validation loss improving by `min_delta`; turns on `val_split` |
+| `min_delta` | `0` | smallest drop in validation loss that counts as improvement for `patience` |
+| `val_split` | `0.1` with `patience`, else unset | fraction of episodes (at least one) held out from training to compute a validation loss each epoch; the export is the epoch with the lowest validation loss, not the last |
 | `batch_size` | `8` | per device; a multi-GPU job logs the effective batch (batch_size × GPUs) |
 | `devices` | `auto` | GPUs to train on: `auto` uses every visible GPU, with distributed data parallel (DDP) when there are several, which halves the steps per epoch on two; `1` forces one |
 | `chunk_size` | `100` | act only: actions predicted per inference; 100 is about 10 s at 10 fps. smolvla's and pi05's are fixed by `pretrained` (50) |

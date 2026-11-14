@@ -138,6 +138,10 @@ def required_argv(tmp_path: Path) -> list[str]:
         ({"devices": 0}, "--devices"),
         ({"devices": -1}, "--devices"),
         ({"devices": "two"}, "--devices"),
+        ({"patience": 0}, "--patience must be at least 1"),
+        ({"min_delta": -0.1}, "--min_delta must be 0 or more"),
+        ({"val_split": 1}, "--val_split must be between 0 and 1"),
+        ({"val_split": 0}, "--val_split must be between 0 and 1"),
     ],
 )
 def test_bad_custom_args_exit_2(tmp_path, capsys, bad, msg):
@@ -159,6 +163,32 @@ def test_precision_and_compression_defaults(tmp_path):
     assert args.precision is None and args.weight_compression == "none"
     args = parse_args([*required_argv(tmp_path), "--precision=bf16-mixed", "--weight_compression=int4"])
     assert args.precision == "bf16-mixed" and args.weight_compression == "int4"
+
+
+def test_early_stopping_defaults(tmp_path):
+    args = parse_args(required_argv(tmp_path))
+    assert (args.val_split, args.patience, args.min_delta) == (None, None, 0.0)
+    args = parse_args([*required_argv(tmp_path), "--patience=3"])
+    assert (args.val_split, args.patience) == (0.1, 3)
+    args = parse_args([*required_argv(tmp_path), "--patience=3", "--val_split=0.25", "--min_delta=0.01"])
+    assert (args.val_split, args.patience, args.min_delta) == (0.25, 3, 0.01)
+
+
+def test_patience_stops_training_and_exports_the_best_epoch(tmp_path, caplog):
+    caplog.set_level("INFO")
+    export = build_export(tmp_path, [CAM])
+    out = tmp_path / "out"
+    # An unreachable min_delta: only the first validation counts as improvement, so patience=1
+    # stops after the second of three epochs.
+    run(local_files(export), out, arm=ARM, cameras=CAM, max_epochs=3, batch_size=2, vcodec="libsvtav1",
+        chunk_size=10, patience=1, min_delta=1e9, val_split=0.5)
+    epochs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Epoch ") and " done:" in r.getMessage()]
+    assert len(epochs) == 2 and all("val loss" in line for line in epochs)
+    assert any(r.getMessage().startswith("Exporting epoch with the best val loss") for r in caplog.records)
+    manifest = json.loads((out / "viam.json").read_text())
+    assert {k: manifest["training"]["args"][k] for k in ("val_split", "patience", "min_delta")} == {
+        "val_split": 0.5, "patience": 1, "min_delta": 1e9,
+    }
 
 
 def test_compression_targets_the_model_not_the_tokenizer(tmp_path):
@@ -485,7 +515,7 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
 
     cb = training.progress_callback(every_s=0)
     trainer = SimpleNamespace(current_epoch=0, num_training_batches=2, estimated_stepping_batches=2, global_step=0,
-                              is_global_zero=True)
+                              is_global_zero=True, callback_metrics={"val/loss": torch.tensor(0.5)})
     caplog.set_level("INFO", logger="physical-ai-studio")
     cb.on_train_epoch_start(trainer, None)
     for i, loss in enumerate([1.0, 3.0]):
@@ -498,6 +528,7 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     assert "loss 3.0000, ~0 min left" in lines[1]
     assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
     assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")
+    assert lines[2].endswith(", val loss 0.5000")
 
 
 def test_progress_callback_is_silent_off_rank_zero(caplog):
