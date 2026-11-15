@@ -189,6 +189,10 @@ def test_patience_stops_training_and_exports_the_best_epoch(tmp_path, caplog):
     assert {k: manifest["training"]["args"][k] for k in ("val_split", "patience", "min_delta")} == {
         "val_split": 0.5, "patience": 1, "min_delta": 1e9,
     }
+    metrics = json.loads((out / "model_metrics.json").read_text())
+    assert manifest["training"]["metrics"] == metrics
+    assert len(metrics["train_loss"]) == len(metrics["val_loss"]) == 2
+    assert metrics["best_epoch"] == [metrics["val_loss"].index(min(metrics["val_loss"]))]
 
 
 def test_compression_targets_the_model_not_the_tokenizer(tmp_path):
@@ -278,6 +282,10 @@ def test_trains_exports_and_runs_inference(tmp_path, layout, export_format):
     frames_per_episode = TICKS if cloud else TICKS - 1  # next_state consumes the last tick
     assert manifest["training"]["episodes"] == 2
     assert manifest["training"]["frames"] == 2 * frames_per_episode
+    # No val_split: one train loss per epoch, no val metrics.
+    assert json.loads((out / "model_metrics.json").read_text()) == manifest["training"]["metrics"]
+    assert list(manifest["training"]["metrics"]) == ["train_loss"]
+    assert len(manifest["training"]["metrics"]["train_loss"]) == 1
 
     # The manifest's input names and shapes must be exactly what the exported model takes.
     model = InferenceModel(out)
@@ -529,6 +537,7 @@ def test_progress_callback_logs_speed_wait_and_loss(caplog):
     assert all(int(line.split("%")[0].rsplit(" ", 1)[1]) <= 100 for line in lines[:2])
     assert lines[2].startswith("Epoch 0 done: mean loss 2.0000 over 2 steps")
     assert lines[2].endswith(", val loss 0.5000")
+    assert cb.metrics == {"train_loss": [2.0], "val_loss": [0.5]}
 
 
 def test_progress_callback_is_silent_off_rank_zero(caplog):

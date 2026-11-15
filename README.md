@@ -14,6 +14,11 @@ its actions. A SmolVLA model version holds `smolvla.xml`, `smolvla.bin`, `tokeni
 `tokenizer.bin` and `manifest.json` in place of the ACT files, plus `viam.json`. A Pi0.5 model version holds
 `pi05.xml`, `pi05.bin` (about 6 GB), `tokenizer.xml`, `tokenizer.bin`, `manifest.json` and `viam.json`.
 
+Each job also writes `model_metrics.json`: per-epoch `train_loss` and, with `val_split`, `val_loss`
+and the exported `best_epoch` (0-based). Viam moves it into the model version's metadata where the
+org has model metrics enabled for custom jobs; otherwise it ships as a file. The same numbers are
+under `training.metrics` in `viam.json`.
+
 ## 1. Record demonstrations
 
 Configure the [capture control sensor](https://docs.viam.com/data/capture-sync/capture-on-demand/)
@@ -107,7 +112,7 @@ registered in the hackathons org (`6d6c7293-bc67-43e4-9c8b-31c76aac27d3`) and is
 
 | | ID | version |
 |---|---|---|
-| training script | `e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio` | `12` |
+| training script | `e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio` | `13` |
 | container | `587f03ad-1d10-4888-9f7f-5d271e5225bd` | `hipsterbrown/viam-openvino-physicalai:0.3.0-6` |
 
 Run the job, and keep the dataset, in the hackathons org:
@@ -116,7 +121,7 @@ Run the job, and keep the dataset, in the hackathons org:
 viam train submit custom from-registry --dataset-id=<dataset-id> \
   --org-id=6d6c7293-bc67-43e4-9c8b-31c76aac27d3 \
   --model-name=<model-name> --model-version=1 \
-  --script-name=e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio --version=12 \
+  --script-name=e76d1b3b-0468-4efd-bb7f-fb1d2b352fcb:physical-ai-studio --version=13 \
   --container-id=587f03ad-1d10-4888-9f7f-5d271e5225bd \
   --args=arm=follower-arm,cameras="'overhead-cam wrist-cam'",image_size=224
 viam train logs --job-id=<job-id>

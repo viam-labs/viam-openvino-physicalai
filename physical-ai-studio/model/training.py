@@ -496,11 +496,15 @@ def progress_callback(every_s: float = 60):
 
     Every `every_s` seconds it logs the window since the last line; at each epoch's end, the epoch's
     mean loss. Times are wall-clock between hooks, so they include the GPU sync the progress bar forces.
-    Rank 0 only; under DDP the loss is rank 0's share of each step.
+    Rank 0 only; under DDP the loss is rank 0's share of each step. Its `metrics` collect each epoch's
+    mean train loss and val loss for model_metrics.json.
     """
     from lightning.pytorch.callbacks import Callback
 
     class Progress(Callback):
+        def __init__(self):
+            self.metrics = {"train_loss": [], "val_loss": []}
+
         def on_train_epoch_start(self, trainer, pl_module):
             if not trainer.is_global_zero:
                 return
@@ -543,10 +547,13 @@ def progress_callback(every_s: float = 60):
             if self.epoch_steps:
                 # Epoch-end validation runs before this hook, so its loss is this epoch's.
                 val = trainer.callback_metrics.get("val/loss")
+                loss = float(self.epoch_loss) / self.epoch_steps
+                self.metrics["train_loss"].append(loss)
+                if val is not None:
+                    self.metrics["val_loss"].append(float(val))
                 logger.info(
                     "Epoch %d done: mean loss %.4f over %d steps in %.0f min%s", trainer.current_epoch,
-                    float(self.epoch_loss) / self.epoch_steps, self.epoch_steps,
-                    (time.monotonic() - self.epoch_start) / 60,
+                    loss, self.epoch_steps, (time.monotonic() - self.epoch_start) / 60,
                     "" if val is None else f", val loss {float(val):.4f}",
                 )
 
@@ -563,7 +570,7 @@ def resolve_devices(requested: int | str) -> int:
 
 
 def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
-    """Train the policy; return it and the device type it trained on."""
+    """Train the policy; return it, the device type it trained on and per-epoch loss metrics."""
     import torch
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
     from physicalai.data import LeRobotDataModule
@@ -583,7 +590,8 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
         repo_id=DATASET_REPO_ID, root=dataset_root, train_batch_size=args.batch_size, **workers, **val
     )
     policy = build_policy(args)
-    callbacks = [progress_callback()]
+    progress = progress_callback()
+    callbacks = [progress]
     if args.val_split:
         # Replaces Lightning's default keep-the-last-epoch checkpoint with the best one, exported below.
         best = ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=1)
@@ -611,7 +619,11 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
         logger.info("Exporting epoch with the best val loss %.4f: %s", float(best.best_model_score), best.best_model_path)
         state = torch.load(best.best_model_path, map_location="cpu", weights_only=False)["state_dict"]
         policy.load_state_dict(state)
-    return policy, device
+    # Viam keeps only list values in model_metrics.json, hence the one-item best_epoch.
+    metrics = {k: v for k, v in progress.metrics.items() if v}
+    if val := metrics.get("val_loss"):
+        metrics["best_epoch"] = [val.index(min(val))]  # the first minimum, as ModelCheckpoint keeps
+    return policy, device, metrics
 
 
 def openvino_model_path(out: Path) -> Path:
@@ -690,7 +702,8 @@ def manifest_components(args: argparse.Namespace, segments) -> list[dict]:
 
 
 def write_manifest(
-    args, out: Path, summary, policy, device: str, wall_time_s: float, versions: dict[str, str]
+    args, out: Path, summary, policy, device: str, wall_time_s: float, versions: dict[str, str],
+    metrics: dict | None = None,
 ) -> dict:
     """Write viam.json: what the inference module needs beyond the export's manifest.json."""
     cameras, state = model_inputs(policy, args.cameras)
@@ -733,6 +746,7 @@ def write_manifest(
             "skipped_sequences": len(summary.skipped),
             "device": device,
             "wall_time_s": round(wall_time_s),
+            "metrics": metrics or {},
         },
         "versions": versions,
     }
@@ -816,11 +830,13 @@ def main(argv: list[str] | None = None) -> None:
                 len(summary.tasks_written), "; ".join(sorted(summary.tasks_written)),
             )
         os.environ["PHYSICALAI_WORK"] = str(work)  # inherited by the ranks Lightning starts in fit()
-        policy, device = train(args, work / "dataset", work / "ckpt")
+        policy, device, metrics = train(args, work / "dataset", work / "ckpt")
         policy.export(out, backend=args.export_format)
         if args.weight_compression != "none":
             compress_weights(out, args.weight_compression)
-    manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions)
+    # Viam moves model_metrics.json into the model package's metadata (custom jobs: behind a feature flag).
+    (out / "model_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    manifest = write_manifest(args, out, summary, policy, device, time.monotonic() - start, versions, metrics)
     logger.info(
         "Done: %d episodes, %d frames, %d sequences skipped, device %s, %ds",
         summary.episodes_written,
