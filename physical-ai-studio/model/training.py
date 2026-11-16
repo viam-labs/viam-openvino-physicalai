@@ -615,7 +615,8 @@ def train(args: argparse.Namespace, dataset_root: Path, ckpt_dir: Path):
             trainer.world_size, device, args.batch_size * trainer.world_size, args.batch_size,
         )
     trainer.fit(model=policy, datamodule=datamodule)
-    if args.val_split and best.best_model_path:
+    # Only rank 0 exports, so only it needs the best weights back.
+    if args.val_split and best.best_model_path and trainer.is_global_zero:
         logger.info("Exporting epoch with the best val loss %.4f: %s", float(best.best_model_score), best.best_model_path)
         state = torch.load(best.best_model_path, map_location="cpu", weights_only=False)["state_dict"]
         policy.load_state_dict(state)
